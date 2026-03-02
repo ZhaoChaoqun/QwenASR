@@ -178,6 +178,18 @@ impl KvCache {
         self.max_seq = new_max;
     }
 
+    /// Shrink back to `target_max` if current capacity exceeds it.
+    /// Only call when `self.len == 0` (cache is logically empty).
+    pub fn shrink_to(&mut self, target_max: usize) {
+        if self.max_seq <= target_max {
+            return;
+        }
+        let total = self.n_layers * target_max * self.kv_dim;
+        self.k = vec![0.0f32; total];
+        self.v = vec![0.0f32; total];
+        self.max_seq = target_max;
+    }
+
     pub fn k_at(&mut self, layer: usize, pos: usize) -> &mut [f32] {
         let off = (layer * self.max_seq + pos) * self.kv_dim;
         &mut self.k[off..off + self.kv_dim]

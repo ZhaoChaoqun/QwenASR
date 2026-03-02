@@ -295,6 +295,7 @@ pub fn forced_align(
     // Step 4: Single prefill pass → logits for all positions
     let t0 = get_time_ms();
     ctx.kv_cache.len = 0;
+    ctx.kv_cache.shrink_to(ctx.kv_initial_max_seq);
 
     let logits = decoder::decoder_prefill_logits(
         &ctx.decoder, cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,

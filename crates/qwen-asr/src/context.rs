@@ -32,6 +32,7 @@ pub struct QwenCtx {
 
     // KV cache
     pub kv_cache: KvCache,
+    pub kv_initial_max_seq: usize,
 
     // Decoder buffers
     pub dec_bufs: DecoderBuffers,
@@ -137,6 +138,7 @@ impl QwenCtx {
             _safetensors: ms,
             model_dir: model_dir.to_string(),
             kv_cache,
+            kv_initial_max_seq: 256,
             dec_bufs,
             enc_bufs: EncoderBuffers::new(),
             rope_cache: RopeCache::new(),

@@ -171,6 +171,7 @@ fn transcribe_segment(
     // Decoder prefill
     let t0 = get_time_ms();
     ctx.kv_cache.len = 0;
+    ctx.kv_cache.shrink_to(ctx.kv_initial_max_seq);
     let prefill_len = total_seq - 1;
     decoder::decoder_prefill(
         &ctx.decoder, cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
