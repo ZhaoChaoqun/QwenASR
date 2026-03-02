@@ -17,6 +17,12 @@ pub enum DecoderKind {
     Int8(DecoderInt8),
 }
 
+/// Wrapper enum for BF16 or INT8 encoder.
+pub enum EncoderKind {
+    BF16(Encoder),
+    Int8(EncoderInt8),
+}
+
 /// Top-level ASR engine state owning model weights, KV cache, and scratch buffers.
 ///
 /// Create with [`QwenCtx::load`], then pass to functions in the [`crate::transcribe`] module.
@@ -32,7 +38,7 @@ pub enum DecoderKind {
 /// | `force_language` | None | Force a language (set via [`QwenCtx::set_force_language`]) |
 pub struct QwenCtx {
     pub config: QwenConfig,
-    pub encoder: Encoder,
+    pub encoder: EncoderKind,
     pub decoder: DecoderKind,
     pub _safetensors: Option<MultiSafetensors>, // kept alive for mmap'd BF16 pointers
     pub _qint8: Option<QuantFile>,              // kept alive for mmap'd INT8/BF16 pointers
@@ -82,11 +88,32 @@ pub struct QwenCtx {
 }
 
 impl QwenCtx {
-    /// Get the BF16 token embeddings pointer (works for both BF16 and INT8 decoder).
+    /// Get the BF16 token embeddings pointer (BF16 decoder only, panics on INT8).
     pub fn tok_embeddings_bf16(&self) -> *const u16 {
         match &self.decoder {
             DecoderKind::BF16(d) => d.tok_embeddings_bf16,
-            DecoderKind::Int8(d) => d.tok_embeddings_bf16,
+            DecoderKind::Int8(_) => panic!("tok_embeddings_bf16 not available on INT8 decoder"),
+        }
+    }
+
+    /// Dequantize a single token embedding to f32 (works for both BF16 and INT8).
+    pub fn tok_embed_to_f32(&self, dst: &mut [f32], token_id: i32, dim: usize) {
+        match &self.decoder {
+            DecoderKind::BF16(d) => {
+                tok_embed_bf16_to_f32(dst, d.tok_embeddings_bf16, token_id, dim);
+            }
+            DecoderKind::Int8(d) => {
+                tok_embed_int8_to_f32(dst, &d.tok_embeddings, token_id, dim);
+            }
+        }
+    }
+
+    /// Run encoder forward pass (dispatches BF16 or INT8).
+    pub fn encoder_forward(&mut self, mel: &[f32], mel_frames: usize) -> Option<(Vec<f32>, usize)> {
+        let cfg = &self.config;
+        match &self.encoder {
+            EncoderKind::BF16(enc) => enc.forward(cfg, mel, mel_frames, Some(&mut self.enc_bufs)),
+            EncoderKind::Int8(enc) => enc.forward(cfg, mel, mel_frames, Some(&mut self.enc_bufs)),
         }
     }
 
@@ -183,11 +210,11 @@ impl QwenCtx {
                 eprintln!("Detected: Qwen3-{}-{} (INT8)", model_type, variant);
             }
 
-            // Load encoder from qint8
+            // Load INT8 encoder from qint8
             if kernels::verbose() >= 1 {
-                eprintln!("Loading encoder weights from qint8...");
+                eprintln!("Loading INT8 encoder weights from qint8...");
             }
-            let encoder = Encoder::load_from_qint8(&qf, &cfg)?;
+            let encoder = EncoderInt8::load_from_qint8(&qf, &cfg)?;
 
             // Load INT8 decoder from qint8
             if kernels::verbose() >= 1 {
@@ -205,7 +232,7 @@ impl QwenCtx {
 
             Some(QwenCtx {
                 config: cfg,
-                encoder,
+                encoder: EncoderKind::Int8(encoder),
                 decoder: DecoderKind::Int8(decoder_int8),
                 _safetensors: None,
                 _qint8: Some(qf),
@@ -279,7 +306,7 @@ impl QwenCtx {
 
             Some(QwenCtx {
                 config: cfg,
-                encoder,
+                encoder: EncoderKind::BF16(encoder),
                 decoder: DecoderKind::BF16(decoder),
                 _safetensors: Some(ms),
                 _qint8: None,

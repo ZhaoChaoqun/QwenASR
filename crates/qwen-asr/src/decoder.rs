@@ -635,6 +635,16 @@ pub fn tok_embed_bf16_to_f32(dst: &mut [f32], tok_emb_bf16: *const u16, token_id
     }
 }
 
+/// Dequantize a single token embedding from INT8 per-row quantized embeddings.
+pub fn tok_embed_int8_to_f32(dst: &mut [f32], w: &QuantWeight, token_id: i32, dim: usize) {
+    let row = token_id as usize;
+    let data = unsafe { std::slice::from_raw_parts(w.data.add(row * dim), dim) };
+    let scale = unsafe { *w.scales.add(row) };
+    for i in 0..dim {
+        dst[i] = (data[i] as f32) * scale;
+    }
+}
+
 // ========================================================================
 // INT8 Quantized Decoder
 // ========================================================================
@@ -656,7 +666,7 @@ unsafe impl Send for DecLayerInt8 {}
 unsafe impl Sync for DecLayerInt8 {}
 
 pub struct DecoderInt8 {
-    pub tok_embeddings_bf16: *const u16,
+    pub tok_embeddings: QuantWeight,
     pub layers: Vec<DecLayerInt8>,
     pub norm: Vec<f32>,
     pub lm_head: Option<QuantWeight>,
@@ -668,7 +678,7 @@ unsafe impl Sync for DecoderInt8 {}
 impl DecoderInt8 {
     /// Load INT8 decoder from a V2 QuantFile.
     pub fn load(qf: &QuantFile, cfg: &QwenConfig) -> Option<Self> {
-        let tok_embeddings_bf16 = qf.get_bf16_direct("thinker.model.embed_tokens.weight")?;
+        let tok_embeddings = qf.get_quant_weight("thinker.model.embed_tokens.weight")?;
 
         let mut layers = Vec::new();
         for i in 0..cfg.dec_layers {
@@ -729,7 +739,7 @@ impl DecoderInt8 {
         let lm_head = qf.get_quant_weight("thinker.lm_head.weight");
 
         Some(DecoderInt8 {
-            tok_embeddings_bf16,
+            tok_embeddings,
             layers,
             norm,
             lm_head,
@@ -937,8 +947,20 @@ pub fn decoder_forward_int8(
         }
         best as i32
     } else {
-        // Tied weights: lm_head = tok_embeddings (BF16)
-        kernels::argmax_matvec_bf16(&bufs.x[..dim], decoder.tok_embeddings_bf16, dim, lm_out_dim) as i32
+        // Tied weights: lm_head = tok_embeddings (INT8)
+        let mut logits = vec![0.0f32; lm_out_dim];
+        kernels::linear_nobias_int8(&mut logits, &bufs.x[..dim],
+                                    decoder.tok_embeddings.data, decoder.tok_embeddings.scales,
+                                    1, dim, lm_out_dim);
+        let mut best = 0usize;
+        let mut best_val = logits[0];
+        for i in 1..lm_out_dim {
+            if logits[i] > best_val {
+                best_val = logits[i];
+                best = i;
+            }
+        }
+        best as i32
     }
 }
 
@@ -966,9 +988,9 @@ pub fn decoder_prefill_logits_int8(
     if let Some(ref lm) = decoder.lm_head {
         kernels::linear_nobias_int8(&mut logits, &x_norm, lm.data, lm.scales, seq_len, dim, out_dim);
     } else {
-        kernels::linear_nobias_bf16_scratch(
-            &mut logits, &x_norm, decoder.tok_embeddings_bf16,
-            seq_len, dim, out_dim, &mut bufs.bf16_scratch,
+        kernels::linear_nobias_int8(
+            &mut logits, &x_norm, decoder.tok_embeddings.data, decoder.tok_embeddings.scales,
+            seq_len, dim, out_dim,
         );
     }
 

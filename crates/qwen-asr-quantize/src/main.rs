@@ -162,7 +162,7 @@ fn main() {
     }
 
     // ---- V2: Pack encoder weights ----
-    let mut bf16_tensors: Vec<BF16WriteEntry> = Vec::new();
+    let bf16_tensors: Vec<BF16WriteEntry> = Vec::new();
 
     let enc_prefix = "thinker.audio_tower.";
     eprintln!("  Packing encoder weights (V2 self-contained) ...");
@@ -181,18 +181,18 @@ fn main() {
         }
     }
 
-    // conv_out.weight (BF16)
+    // conv_out.weight (INT8)
     {
         let name = format!("{}conv_out.weight", enc_prefix);
-        pack_bf16(&ms, &name, &mut bf16_tensors);
+        quantize_and_push(&ms, &name, &mut quant_tensors);
     }
 
     // Encoder transformer layers
     for i in 0..cfg.enc_layers {
         let lp = format!("{}layers.{}", enc_prefix, i);
-        eprint!("  Packing encoder layer {}/{} ...\r", i + 1, cfg.enc_layers);
+        eprint!("  Quantizing encoder layer {}/{} ...\r", i + 1, cfg.enc_layers);
 
-        // BF16 weight matrices
+        // INT8 weight matrices
         for suffix in &[
             "self_attn.q_proj.weight",
             "self_attn.k_proj.weight",
@@ -202,7 +202,7 @@ fn main() {
             "fc2.weight",
         ] {
             let name = format!("{}.{}", lp, suffix);
-            pack_bf16(&ms, &name, &mut bf16_tensors);
+            quantize_and_push(&ms, &name, &mut quant_tensors);
         }
 
         // F32 biases and norms
@@ -228,7 +228,7 @@ fn main() {
             f32_tensors.push(F32WriteEntry { name, shape, data });
         }
     }
-    eprintln!("  Packed {} encoder layers.                ", cfg.enc_layers);
+    eprintln!("  Quantized {} encoder layers.                ", cfg.enc_layers);
 
     // ln_post, proj1, proj2
     for suffix in &["ln_post.weight", "ln_post.bias", "proj1.bias", "proj2.bias"] {
@@ -243,14 +243,14 @@ fn main() {
     }
     for suffix in &["proj1.weight", "proj2.weight"] {
         let name = format!("{}{}", enc_prefix, suffix);
-        pack_bf16(&ms, &name, &mut bf16_tensors);
+        quantize_and_push(&ms, &name, &mut quant_tensors);
     }
 
-    // ---- V2: Token embeddings (BF16) ----
+    // ---- V2: Token embeddings (INT8) ----
     {
         let name = "thinker.model.embed_tokens.weight";
-        eprintln!("  Packing token embeddings ...");
-        pack_bf16(&ms, name, &mut bf16_tensors);
+        eprintln!("  Quantizing token embeddings ...");
+        quantize_and_push(&ms, name, &mut quant_tensors);
     }
 
     // ---- Write V2 output ----
@@ -279,22 +279,26 @@ fn main() {
     );
 }
 
-/// Helper: read a BF16 tensor from safetensors and add as BF16WriteEntry.
-fn pack_bf16(ms: &MultiSafetensors, name: &str, bf16_tensors: &mut Vec<BF16WriteEntry>) {
-    let (si, tmeta) = ms.find(name).unwrap_or_else(|| {
+/// Helper: read a BF16 tensor from safetensors, quantize to INT8, and add as QuantWriteEntry.
+fn quantize_and_push(ms: &MultiSafetensors, name: &str, quant_tensors: &mut Vec<QuantWriteEntry>) {
+    let (_, tmeta) = ms.find(name).unwrap_or_else(|| {
         eprintln!("BF16 weight not found: {}", name);
         std::process::exit(1);
     });
-    let bf16_ptr = ms.shards[si].get_bf16_direct(tmeta).unwrap_or_else(|| {
+    let out_dim = tmeta.shape[0] as usize;
+    let in_dim = tmeta.shape[1] as usize;
+
+    let bf16_ptr = ms.get_bf16_direct(name).unwrap_or_else(|| {
         eprintln!("Failed to get BF16 pointer for {}", name);
         std::process::exit(1);
     });
-    let n = tmeta.numel();
-    let data = unsafe { std::slice::from_raw_parts(bf16_ptr, n) }.to_vec();
-    let shape: Vec<usize> = tmeta.shape.iter().map(|&d| d as usize).collect();
-    bf16_tensors.push(BF16WriteEntry {
+
+    let (int8_data, scales) = quantize_bf16_to_int8(bf16_ptr, out_dim, in_dim);
+
+    quant_tensors.push(QuantWriteEntry {
         name: name.to_string(),
-        shape,
-        data,
+        shape: vec![out_dim, in_dim],
+        int8_data,
+        scales,
     });
 }

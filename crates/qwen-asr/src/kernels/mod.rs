@@ -660,6 +660,18 @@ pub fn linear_nobias_int8(y: &mut [f32], x: &[f32], w_int8: *const i8, scales: *
     }
 }
 
+/// INT8 quantized linear layer with optional bias: y = scale * (W_int8 @ x) + bias
+pub fn linear_int8(y: &mut [f32], x: &[f32], w_int8: *const i8, scales: *const f32, bias: Option<&[f32]>, seq_len: usize, in_dim: usize, out_dim: usize) {
+    linear_nobias_int8(y, x, w_int8, scales, seq_len, in_dim, out_dim);
+    if let Some(b) = bias {
+        for s in 0..seq_len {
+            for o in 0..out_dim {
+                y[s * out_dim + o] += b[o];
+            }
+        }
+    }
+}
+
 pub fn linear_nobias_bf16(y: &mut [f32], x: &[f32], w_bf16: *const u16, seq_len: usize, in_dim: usize, out_dim: usize) {
     let _pg = ProfileGuard::new(&PROF.bf16_matvec);
     if seq_len == 1 {

@@ -3,7 +3,6 @@
 use crate::audio;
 use crate::config::*;
 use crate::context::QwenCtx;
-use crate::decoder::tok_embed_bf16_to_f32;
 use crate::kernels;
 use crate::tokenizer::QwenTokenizer;
 
@@ -240,7 +239,7 @@ pub fn forced_align(
     let mel_ms = elapsed_ms(t0);
 
     let t0 = get_time_ms();
-    let (enc_output, enc_seq_len) = ctx.encoder.forward(cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))?;
+    let (enc_output, enc_seq_len) = ctx.encoder_forward(&mel, mel_frames)?;
     let enc_ms = elapsed_ms(t0);
 
     if kernels::verbose() >= 2 {
@@ -256,15 +255,14 @@ pub fn forced_align(
     let total_seq = prefix_len + enc_seq_len + suffix_len + text_tokens.len();
 
     let mut input_embeds = vec![0.0f32; total_seq * dim];
-    let tok_emb = ctx.tok_embeddings_bf16();
 
     let mut off = 0;
     for &tok in PREFIX_HEAD {
-        tok_embed_bf16_to_f32(&mut input_embeds[off * dim..(off + 1) * dim], tok_emb, tok, dim);
+        ctx.tok_embed_to_f32(&mut input_embeds[off * dim..(off + 1) * dim], tok, dim);
         off += 1;
     }
     for &tok in PREFIX_TAIL {
-        tok_embed_bf16_to_f32(&mut input_embeds[off * dim..(off + 1) * dim], tok_emb, tok, dim);
+        ctx.tok_embed_to_f32(&mut input_embeds[off * dim..(off + 1) * dim], tok, dim);
         off += 1;
     }
 
@@ -277,18 +275,18 @@ pub fn forced_align(
     // Suffix
     let suffix_off = prefix_len + enc_seq_len;
     for (i, &tok) in SUFFIX_BASE.iter().enumerate() {
-        tok_embed_bf16_to_f32(
+        ctx.tok_embed_to_f32(
             &mut input_embeds[(suffix_off + i) * dim..(suffix_off + i + 1) * dim],
-            tok_emb, tok, dim,
+            tok, dim,
         );
     }
 
     // Text tokens (with interleaved <timestamp> tokens)
     let text_off = suffix_off + suffix_len;
     for (i, &tok) in text_tokens.iter().enumerate() {
-        tok_embed_bf16_to_f32(
+        ctx.tok_embed_to_f32(
             &mut input_embeds[(text_off + i) * dim..(text_off + i + 1) * dim],
-            tok_emb, tok, dim,
+            tok, dim,
         );
     }
 
