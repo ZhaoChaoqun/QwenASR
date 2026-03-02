@@ -23,10 +23,10 @@ const STREAM_RESET_CARRY_TOKENS: usize = 24;
 const STREAM_MAX_ENC_WINDOWS: usize = 4;
 /// Dynamic re-anchor threshold: when total encoder sequence length (cached +
 /// partial) exceeds this value, trigger a re-anchor to prevent decoder degeneracy.
-/// ~150 encoder tokens ≈ 11-12s of audio. Triggers before degeneracy onset (~15s)
-/// so that re-anchor is proactive (preventing repetition) rather than reactive
-/// (cleaning up after damage). Short audio (<10s, <130 tokens) unaffected.
-const STREAM_REANCHOR_ENC_SEQ_THRESHOLD: usize = 150;
+/// ~200 encoder tokens ≈ 15s of audio. After re-anchor, the most recent encoder
+/// window (~104 tokens) is preserved, so the effective new-audio budget is ~96
+/// tokens (~7s) before the next re-anchor. Short audio (<10s) is unaffected.
+const STREAM_REANCHOR_ENC_SEQ_THRESHOLD: usize = 200;
 
 fn get_time_ms() -> f64 {
     // Use monotonic clock
@@ -727,9 +727,15 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             prev_prefill_len = 0;
             stale_count = 0;
             prev_tail_snapshot.clear();
-            enc_cache_base_windows += enc_cache.len();
-            enc_cache.clear();
-            enc_cached_seq_total = 0;
+            // Keep the most recent encoder window for boundary context
+            let keep_windows = 1.min(enc_cache.len());
+            let drop_windows = enc_cache.len() - keep_windows;
+            if drop_windows > 0 {
+                let drop_seq: usize = enc_cache[..drop_windows].iter().map(|w| w.seq_len).sum();
+                enc_cache_base_windows += drop_windows;
+                enc_cache.drain(..drop_windows);
+                enc_cached_seq_total = enc_cached_seq_total.saturating_sub(drop_seq);
+            }
         }
 
         // Parse text region
@@ -1255,9 +1261,17 @@ pub fn stream_push_audio(
             state.prev_prefill_len = 0;
             state.stale_count = 0;
             state.prev_tail_snapshot.clear();
-            state.enc_cache_base_windows += state.enc_cache.len();
-            state.enc_cache.clear();
-            state.enc_cached_seq_total = 0;
+            // Keep the most recent encoder window to provide context for the next
+            // segment. Without this, the decoder loses track of what was being said
+            // at the re-anchor boundary, causing truncated/garbled output.
+            let keep_windows = 1.min(state.enc_cache.len());
+            let drop_windows = state.enc_cache.len() - keep_windows;
+            if drop_windows > 0 {
+                let drop_seq: usize = state.enc_cache[..drop_windows].iter().map(|w| w.seq_len).sum();
+                state.enc_cache_base_windows += drop_windows;
+                state.enc_cache.drain(..drop_windows);
+                state.enc_cached_seq_total = state.enc_cached_seq_total.saturating_sub(drop_seq);
+            }
         }
     }
 
