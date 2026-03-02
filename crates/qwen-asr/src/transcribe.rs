@@ -884,6 +884,31 @@ impl StreamState {
     pub fn audio_cursor(&self) -> usize {
         self.audio_cursor
     }
+
+    /// Get currently decoded but not-yet-stable (speculative) text.
+    /// Returns text from tokens that have been decoded but not yet committed
+    /// to the stable result (i.e. still within the rollback/unfixed window).
+    pub fn unfixed_text(&self) -> String {
+        let tokenizer = match self.tokenizer.as_ref() {
+            Some(t) => t,
+            None => return String::new(),
+        };
+        let text_start = self.raw_tokens.iter()
+            .position(|&t| t == TOKEN_ASR_TEXT)
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let all_text_tokens = &self.raw_tokens[text_start..];
+        let stable_count = self.stable_text_tokens.len();
+        if all_text_tokens.len() <= stable_count {
+            return String::new();
+        }
+        let unfixed_tokens = &all_text_tokens[stable_count..];
+        let mut bytes = Vec::new();
+        for &tok in unfixed_tokens {
+            bytes.extend_from_slice(tokenizer.decode_bytes(tok));
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
 }
 
 /// Process all available new audio incrementally.

@@ -264,6 +264,27 @@ pub unsafe extern "C" fn qwen_asr_stream_get_result(
     }
 }
 
+/// Get currently decoded but not-yet-stable (speculative) text.
+/// Returns heap-allocated C string, or NULL if empty.
+/// Caller must free with `qwen_asr_free_string`.
+#[no_mangle]
+pub unsafe extern "C" fn qwen_asr_stream_get_unfixed(
+    stream: *mut QwenAsrStreamState,
+) -> *mut c_char {
+    if stream.is_null() {
+        return std::ptr::null_mut();
+    }
+    let s = &*stream;
+    let text = s.state.unfixed_text();
+    if text.is_empty() {
+        return std::ptr::null_mut();
+    }
+    match CString::new(text) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// Configure streaming chunk size in seconds (default 2.0).
 #[no_mangle]
 pub unsafe extern "C" fn qwen_asr_stream_set_chunk_sec(engine: *mut QwenAsrEngine, sec: f32) {
