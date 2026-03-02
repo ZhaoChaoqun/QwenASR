@@ -23,8 +23,10 @@ const STREAM_RESET_CARRY_TOKENS: usize = 24;
 const STREAM_MAX_ENC_WINDOWS: usize = 4;
 /// Dynamic re-anchor threshold: when total encoder sequence length (cached +
 /// partial) exceeds this value, trigger a re-anchor to prevent decoder degeneracy.
-/// ~200 encoder tokens ≈ 15s of audio. Short audio (<10s, <130 tokens) unaffected.
-const STREAM_REANCHOR_ENC_SEQ_THRESHOLD: usize = 200;
+/// ~150 encoder tokens ≈ 11-12s of audio. Triggers before degeneracy onset (~15s)
+/// so that re-anchor is proactive (preventing repetition) rather than reactive
+/// (cleaning up after damage). Short audio (<10s, <130 tokens) unaffected.
+const STREAM_REANCHOR_ENC_SEQ_THRESHOLD: usize = 150;
 
 fn get_time_ms() -> f64 {
     // Use monotonic clock
