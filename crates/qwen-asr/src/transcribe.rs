@@ -21,6 +21,10 @@ const STREAM_STALE_CHUNKS: i32 = 4;
 const STREAM_RESET_INTERVAL_CHUNKS: i32 = 45;
 const STREAM_RESET_CARRY_TOKENS: usize = 24;
 const STREAM_MAX_ENC_WINDOWS: usize = 4;
+/// Dynamic re-anchor threshold: when accumulated encoder sequence length
+/// exceeds this value, trigger a re-anchor to prevent decoder degeneracy.
+/// ~300 encoder tokens ≈ 12-15s of audio, well before degeneracy onset (~15-20s).
+const STREAM_REANCHOR_ENC_SEQ_THRESHOLD: usize = 300;
 
 fn get_time_ms() -> f64 {
     // Use monotonic clock
@@ -716,10 +720,15 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             prev_tail_snapshot.clear();
         }
 
-        // Periodic re-anchor: reset context every STREAM_RESET_INTERVAL_CHUNKS chunks
-        if chunk_idx > 0 && chunk_idx % STREAM_RESET_INTERVAL_CHUNKS == 0 {
+        // Dynamic re-anchor: trigger when encoder cache accumulates too many tokens,
+        // OR at fixed interval (whichever comes first). This prevents decoder
+        // degeneracy on long audio while leaving short audio unaffected.
+        let should_reanchor = (chunk_idx > 0 && chunk_idx % STREAM_RESET_INTERVAL_CHUNKS == 0)
+            || enc_cached_seq_total >= STREAM_REANCHOR_ENC_SEQ_THRESHOLD;
+        if should_reanchor {
             if kernels::verbose() >= 2 {
-                eprintln!("[stream reanchor] at chunk {}", chunk_idx);
+                eprintln!("[stream reanchor] at chunk {} (enc_seq={})",
+                    chunk_idx, enc_cached_seq_total);
             }
             let carry = stable_text_tokens.len().min(STREAM_RESET_CARRY_TOKENS);
             let carry_start = stable_text_tokens.len() - carry;
@@ -1241,17 +1250,19 @@ pub fn stream_push_audio(
             state.prev_prefill_len = 0;
             state.stale_count = 0;
             state.prev_tail_snapshot.clear();
-            if state.enc_cache.len() >= STREAM_MAX_ENC_WINDOWS {
-                state.enc_cache_base_windows += state.enc_cache.len();
-                state.enc_cache.clear();
-                state.enc_cached_seq_total = 0;
-            }
+            state.enc_cache_base_windows += state.enc_cache.len();
+            state.enc_cache.clear();
+            state.enc_cached_seq_total = 0;
         }
 
-        // Periodic re-anchor: reset context every STREAM_RESET_INTERVAL_CHUNKS chunks
-        if state.chunk_idx > 0 && state.chunk_idx % STREAM_RESET_INTERVAL_CHUNKS == 0 {
+        // Dynamic re-anchor: trigger when encoder cache accumulates too many tokens,
+        // OR at fixed interval (whichever comes first).
+        let should_reanchor = (state.chunk_idx > 0 && state.chunk_idx % STREAM_RESET_INTERVAL_CHUNKS == 0)
+            || state.enc_cached_seq_total >= STREAM_REANCHOR_ENC_SEQ_THRESHOLD;
+        if should_reanchor {
             if kernels::verbose() >= 2 {
-                eprintln!("[stream reanchor] at chunk {}", state.chunk_idx);
+                eprintln!("[stream reanchor] at chunk {} (enc_seq={})",
+                    state.chunk_idx, state.enc_cached_seq_total);
             }
             let carry = state.stable_text_tokens.len().min(STREAM_RESET_CARRY_TOKENS);
             let carry_start = state.stable_text_tokens.len() - carry;
@@ -1264,11 +1275,9 @@ pub fn stream_push_audio(
             state.prev_prefill_len = 0;
             state.stale_count = 0;
             state.prev_tail_snapshot.clear();
-            if state.enc_cache.len() >= STREAM_MAX_ENC_WINDOWS {
-                state.enc_cache_base_windows += state.enc_cache.len();
-                state.enc_cache.clear();
-                state.enc_cached_seq_total = 0;
-            }
+            state.enc_cache_base_windows += state.enc_cache.len();
+            state.enc_cache.clear();
+            state.enc_cached_seq_total = 0;
         }
     }
 
