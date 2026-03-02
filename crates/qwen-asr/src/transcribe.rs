@@ -21,10 +21,10 @@ const STREAM_STALE_CHUNKS: i32 = 4;
 const STREAM_RESET_INTERVAL_CHUNKS: i32 = 45;
 const STREAM_RESET_CARRY_TOKENS: usize = 24;
 const STREAM_MAX_ENC_WINDOWS: usize = 4;
-/// Dynamic re-anchor threshold: when accumulated encoder sequence length
-/// exceeds this value, trigger a re-anchor to prevent decoder degeneracy.
-/// ~300 encoder tokens ≈ 12-15s of audio, well before degeneracy onset (~15-20s).
-const STREAM_REANCHOR_ENC_SEQ_THRESHOLD: usize = 300;
+/// Dynamic re-anchor threshold: when total encoder sequence length (cached +
+/// partial) exceeds this value, trigger a re-anchor to prevent decoder degeneracy.
+/// ~200 encoder tokens ≈ 15s of audio. Short audio (<10s, <130 tokens) unaffected.
+const STREAM_REANCHOR_ENC_SEQ_THRESHOLD: usize = 200;
 
 fn get_time_ms() -> f64 {
     // Use monotonic clock
@@ -706,12 +706,13 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         // Dynamic re-anchor: trigger when encoder cache accumulates too many tokens,
         // OR at fixed interval (whichever comes first). This prevents decoder
         // degeneracy on long audio while leaving short audio unaffected.
+        // Use enc_seq_len (cached + partial) to match actual decoder input length.
         let should_reanchor = (chunk_idx > 0 && chunk_idx % STREAM_RESET_INTERVAL_CHUNKS == 0)
-            || enc_cached_seq_total >= STREAM_REANCHOR_ENC_SEQ_THRESHOLD;
+            || enc_seq_len >= STREAM_REANCHOR_ENC_SEQ_THRESHOLD;
         if should_reanchor {
             if kernels::verbose() >= 2 {
                 eprintln!("[stream reanchor] at chunk {} (enc_seq={})",
-                    chunk_idx, enc_cached_seq_total);
+                    chunk_idx, enc_seq_len);
             }
             let carry = stable_text_tokens.len().min(STREAM_RESET_CARRY_TOKENS);
             let carry_start = stable_text_tokens.len() - carry;
@@ -1232,12 +1233,14 @@ pub fn stream_push_audio(
 
         // Dynamic re-anchor: trigger when encoder cache accumulates too many tokens,
         // OR at fixed interval (whichever comes first).
+        // Use enc_seq_len (cached + partial) instead of just cached, since partial
+        // encoder output also contributes to decoder cross-attention length.
         let should_reanchor = (state.chunk_idx > 0 && state.chunk_idx % STREAM_RESET_INTERVAL_CHUNKS == 0)
-            || state.enc_cached_seq_total >= STREAM_REANCHOR_ENC_SEQ_THRESHOLD;
+            || enc_seq_len >= STREAM_REANCHOR_ENC_SEQ_THRESHOLD;
         if should_reanchor {
             if kernels::verbose() >= 2 {
                 eprintln!("[stream reanchor] at chunk {} (enc_seq={})",
-                    state.chunk_idx, state.enc_cached_seq_total);
+                    state.chunk_idx, enc_seq_len);
             }
             let carry = state.stable_text_tokens.len().min(STREAM_RESET_CARRY_TOKENS);
             let carry_start = state.stable_text_tokens.len() - carry;
