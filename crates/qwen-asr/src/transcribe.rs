@@ -746,7 +746,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             stale_count = 0;
             prev_tail_snapshot.clear();
             // Keep 2 most recent encoder windows for continuity
-            let keep_windows = 2.min(enc_cache.len());
+            let keep_windows = 1.min(enc_cache.len());
             let drop_windows = enc_cache.len() - keep_windows;
             if drop_windows > 0 {
                 let drop_seq: usize = enc_cache[..drop_windows].iter().map(|w| w.seq_len).sum();
@@ -1256,8 +1256,8 @@ pub fn stream_push_audio(
             state.prev_prefill_len = 0;
             state.stale_count = 0;
             state.prev_tail_snapshot.clear();
-            // On degeneracy, keep 2 encoder windows like re-anchor
-            let keep_windows = 2.min(state.enc_cache.len());
+            // On degeneracy, keep 1 encoder window like re-anchor
+            let keep_windows = 1.min(state.enc_cache.len());
             let drop_windows = state.enc_cache.len() - keep_windows;
             if drop_windows > 0 {
                 let drop_seq: usize = state.enc_cache[..drop_windows].iter().map(|w| w.seq_len).sum();
@@ -1294,11 +1294,10 @@ pub fn stream_push_audio(
             state.prev_prefill_len = 0;
             state.stale_count = 0;
             state.prev_tail_snapshot.clear();
-            // Keep the 2 most recent encoder windows (~16s of context) to provide
-            // continuity across re-anchor boundaries. Dropping older windows prevents
-            // the decoder from attending to excessively long encoder sequences which
-            // causes degeneracy (repetition) in streaming mode.
-            let keep_windows = 2.min(state.enc_cache.len());
+            // Keep 1 most recent encoder window (~8s context). Keeping 2+ causes
+            // decoder degeneracy (repetition) because the decoder can't handle long
+            // encoder sequences with max_new_tokens=32 per chunk in streaming mode.
+            let keep_windows = 1.min(state.enc_cache.len());
             let drop_windows = state.enc_cache.len() - keep_windows;
             if drop_windows > 0 {
                 let drop_seq: usize = state.enc_cache[..drop_windows].iter().map(|w| w.seq_len).sum();
