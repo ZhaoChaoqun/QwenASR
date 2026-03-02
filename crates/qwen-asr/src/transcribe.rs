@@ -22,6 +22,34 @@ const STREAM_RESET_INTERVAL_CHUNKS: i32 = 45;
 const STREAM_RESET_CARRY_TOKENS: usize = 24;
 const STREAM_MAX_ENC_WINDOWS: usize = 4;
 
+/// Return the position of the last complete UTF-8 character boundary in `bytes`.
+/// `bytes[..safe_end]` is guaranteed to be valid UTF-8 (assuming valid prefixes),
+/// while `bytes[safe_end..]` contains an incomplete trailing multi-byte sequence.
+fn utf8_safe_boundary(bytes: &[u8]) -> usize {
+    let len = bytes.len();
+    if len == 0 {
+        return 0;
+    }
+    // Scan backwards up to 4 bytes to find the last leading byte
+    let mut i = len;
+    while i > 0 && i > len.saturating_sub(4) {
+        i -= 1;
+        let b = bytes[i];
+        if b & 0xC0 != 0x80 {
+            // Found a leading byte; check if its sequence is complete
+            let expected_len = match b {
+                0x00..=0x7F => 1,
+                0xC0..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                0xF0..=0xF7 => 4,
+                _ => 1, // invalid leading byte, treat as single-byte
+            };
+            return if i + expected_len <= len { len } else { i };
+        }
+    }
+    len // all bytes are continuation bytes – return everything
+}
+
 fn get_time_ms() -> f64 {
     // Use monotonic clock
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -829,6 +857,9 @@ pub struct StreamState {
     // Tokenizer (loaded once)
     tokenizer: Option<QwenTokenizer>,
     prompt_prepared: bool,
+
+    // UTF-8 safety: incomplete trailing bytes from the last delta
+    pending_delta_bytes: Vec<u8>,
 }
 
 impl StreamState {
@@ -852,6 +883,7 @@ impl StreamState {
             chunk_idx: 0,
             tokenizer: None,
             prompt_prepared: false,
+            pending_delta_bytes: Vec::new(),
         }
     }
 
@@ -872,12 +904,16 @@ impl StreamState {
         self.last_partial_seq = 0;
         self.audio_cursor = 0;
         self.chunk_idx = 0;
+        self.pending_delta_bytes.clear();
         // Keep tokenizer and prompt_prepared
     }
 
     /// Get the current stable transcription result.
+    /// Trailing incomplete UTF-8 bytes (from split BPE tokens) are excluded
+    /// so the caller always receives a valid UTF-8 string.
     pub fn text(&self) -> String {
-        String::from_utf8_lossy(&self.result_bytes).into_owned()
+        let safe_end = utf8_safe_boundary(&self.result_bytes);
+        String::from_utf8_lossy(&self.result_bytes[..safe_end]).into_owned()
     }
 
     /// Get how many samples have been processed so far.
@@ -932,7 +968,7 @@ pub fn stream_push_audio(
     let enc_window_samples = enc_window_frames * HOP_LENGTH;
     let tok_emb = ctx.decoder.tok_embeddings_bf16;
     let mut tmp_embed = vec![0.0f32; dim];
-    let mut delta_bytes: Vec<u8> = Vec::new();
+    let mut delta_bytes: Vec<u8> = std::mem::take(&mut state.pending_delta_bytes);
 
     // ---- Process full chunks, plus remainder if finalizing ----
     while state.audio_cursor < samples.len() {
@@ -1293,6 +1329,13 @@ pub fn stream_push_audio(
             break;
         }
     } // end while loop
+
+    // Preserve any trailing incomplete UTF-8 bytes for the next call's delta.
+    let safe_end = utf8_safe_boundary(&delta_bytes);
+    if safe_end < delta_bytes.len() {
+        state.pending_delta_bytes = delta_bytes[safe_end..].to_vec();
+        delta_bytes.truncate(safe_end);
+    }
 
     Some(String::from_utf8_lossy(&delta_bytes).into_owned())
 }
