@@ -699,6 +699,11 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
                 raw_tokens.push(TOKEN_ASR_TEXT);
                 raw_tokens.extend_from_slice(&stable_text_tokens[carry_start..]);
             }
+            // Align stable_text_tokens with the carry tokens now in raw_tokens,
+            // so that emit_from == carry and new tokens can be emitted after reset.
+            let carry_tokens: Vec<i32> = stable_text_tokens[carry_start..].to_vec();
+            stable_text_tokens.clear();
+            stable_text_tokens.extend_from_slice(&carry_tokens);
             prev_prefill_embeds.clear();
             prev_prefill_len = 0;
             stale_count = 0;
@@ -723,6 +728,11 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
                 raw_tokens.push(TOKEN_ASR_TEXT);
                 raw_tokens.extend_from_slice(&stable_text_tokens[carry_start..]);
             }
+            // Align stable_text_tokens with the carry tokens now in raw_tokens,
+            // so that emit_from == carry and new tokens can be emitted after re-anchor.
+            let carry_tokens: Vec<i32> = stable_text_tokens[carry_start..].to_vec();
+            stable_text_tokens.clear();
+            stable_text_tokens.extend_from_slice(&carry_tokens);
             prev_prefill_embeds.clear();
             prev_prefill_len = 0;
             stale_count = 0;
@@ -1230,6 +1240,11 @@ pub fn stream_push_audio(
                 state.raw_tokens.push(TOKEN_ASR_TEXT);
                 state.raw_tokens.extend_from_slice(&state.stable_text_tokens[carry_start..]);
             }
+            // Align stable_text_tokens with the carry tokens now in raw_tokens,
+            // so that emit_from == carry and new tokens can be emitted after reset.
+            let carry_tokens: Vec<i32> = state.stable_text_tokens[carry_start..].to_vec();
+            state.stable_text_tokens.clear();
+            state.stable_text_tokens.extend_from_slice(&carry_tokens);
             state.prev_prefill_embeds.clear();
             state.prev_prefill_len = 0;
             state.stale_count = 0;
@@ -1257,6 +1272,11 @@ pub fn stream_push_audio(
                 state.raw_tokens.push(TOKEN_ASR_TEXT);
                 state.raw_tokens.extend_from_slice(&state.stable_text_tokens[carry_start..]);
             }
+            // Align stable_text_tokens with the carry tokens now in raw_tokens,
+            // so that emit_from == carry and new tokens can be emitted after re-anchor.
+            let carry_tokens: Vec<i32> = state.stable_text_tokens[carry_start..].to_vec();
+            state.stable_text_tokens.clear();
+            state.stable_text_tokens.extend_from_slice(&carry_tokens);
             state.prev_prefill_embeds.clear();
             state.prev_prefill_len = 0;
             state.stale_count = 0;
