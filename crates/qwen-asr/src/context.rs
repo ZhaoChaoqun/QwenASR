@@ -123,7 +123,7 @@ impl QwenCtx {
         let decoder = Decoder::load(&ms, &cfg)?;
 
         let kv_dim = cfg.dec_kv_heads * cfg.dec_head_dim;
-        let kv_cache = KvCache::new(cfg.dec_layers, 2048, kv_dim);
+        let kv_cache = KvCache::new(cfg.dec_layers, 256, kv_dim);
         let dec_bufs = DecoderBuffers::new(&cfg);
 
         if kernels::verbose() >= 1 {
