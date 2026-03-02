@@ -21,11 +21,14 @@ const STREAM_RESET_INTERVAL_CHUNKS: i32 = 45;
 const STREAM_RESET_CARRY_TOKENS: usize = 24;
 const STREAM_MAX_ENC_WINDOWS: usize = 4;
 /// Dynamic re-anchor threshold: when total encoder sequence length (cached +
-/// partial) exceeds this value, trigger a re-anchor to prevent decoder degeneracy.
-/// ~200 encoder tokens ≈ 15s of audio. After re-anchor, the most recent encoder
-/// window (~104 tokens) is preserved, so the effective new-audio budget is ~96
-/// tokens (~7s) before the next re-anchor. Short audio (<10s) is unaffected.
-const STREAM_REANCHOR_ENC_SEQ_THRESHOLD: usize = 200;
+/// partial) exceeds this value, trigger a re-anchor to reset decoder state.
+/// Re-anchor now preserves ALL encoder cache (mirroring the official Qwen3-ASR
+/// streaming strategy), so this threshold only controls how often the decoder
+/// KV cache is rebuilt. Higher = fewer rebuilds = less latency overhead, but
+/// the decoder must attend to a longer encoder sequence each chunk.
+/// ~390 encoder tokens ≈ 30s of audio. This allows up to 30s of continuous
+/// speech before the first re-anchor. Short audio (<20s) is unaffected.
+const STREAM_REANCHOR_ENC_SEQ_THRESHOLD: usize = 390;
 
 fn get_time_ms() -> f64 {
     // Use monotonic clock
@@ -1236,9 +1239,7 @@ pub fn stream_push_audio(
             state.prev_prefill_len = 0;
             state.stale_count = 0;
             state.prev_tail_snapshot.clear();
-            state.enc_cache_base_windows += state.enc_cache.len();
-            state.enc_cache.clear();
-            state.enc_cached_seq_total = 0;
+            // Keep ALL encoder cache on degeneracy reset too — only reset decoder state.
         }
 
         // Dynamic re-anchor: trigger when encoder cache accumulates too many tokens,
