@@ -22,13 +22,13 @@ const STREAM_RESET_CARRY_TOKENS: usize = 24;
 const STREAM_MAX_ENC_WINDOWS: usize = 4;
 /// Dynamic re-anchor threshold: when total encoder sequence length (cached +
 /// partial) exceeds this value, trigger a re-anchor to reset decoder state.
-/// Re-anchor now preserves ALL encoder cache (mirroring the official Qwen3-ASR
-/// streaming strategy), so this threshold only controls how often the decoder
-/// KV cache is rebuilt. Higher = fewer rebuilds = less latency overhead, but
-/// the decoder must attend to a longer encoder sequence each chunk.
-/// ~390 encoder tokens ≈ 30s of audio. This allows up to 30s of continuous
-/// speech before the first re-anchor. Short audio (<20s) is unaffected.
-const STREAM_REANCHOR_ENC_SEQ_THRESHOLD: usize = 390;
+/// Re-anchor preserves the most recent 2 encoder windows (~16s of context)
+/// while dropping older ones, providing a balance between audio continuity
+/// and decoder stability.
+/// ~200 encoder tokens ≈ 15s of audio. With 2 windows kept (~208 tokens),
+/// re-anchor starts trimming at ~15s and the decoder always sees at least
+/// the last ~16s of context.
+const STREAM_REANCHOR_ENC_SEQ_THRESHOLD: usize = 200;
 
 fn get_time_ms() -> f64 {
     // Use monotonic clock
@@ -707,6 +707,15 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             prev_prefill_len = 0;
             stale_count = 0;
             prev_tail_snapshot.clear();
+            // On degeneracy, keep 2 encoder windows like re-anchor
+            let keep_windows = 2.min(enc_cache.len());
+            let drop_windows = enc_cache.len() - keep_windows;
+            if drop_windows > 0 {
+                let drop_seq: usize = enc_cache[..drop_windows].iter().map(|w| w.seq_len).sum();
+                enc_cache_base_windows += drop_windows;
+                enc_cache.drain(..drop_windows);
+                enc_cached_seq_total = enc_cached_seq_total.saturating_sub(drop_seq);
+            }
         }
 
         // Dynamic re-anchor: trigger when encoder cache accumulates too many tokens,
@@ -736,7 +745,15 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             prev_prefill_len = 0;
             stale_count = 0;
             prev_tail_snapshot.clear();
-            // Keep ALL encoder cache — see stream_push_audio re-anchor for rationale.
+            // Keep 2 most recent encoder windows for continuity
+            let keep_windows = 2.min(enc_cache.len());
+            let drop_windows = enc_cache.len() - keep_windows;
+            if drop_windows > 0 {
+                let drop_seq: usize = enc_cache[..drop_windows].iter().map(|w| w.seq_len).sum();
+                enc_cache_base_windows += drop_windows;
+                enc_cache.drain(..drop_windows);
+                enc_cached_seq_total = enc_cached_seq_total.saturating_sub(drop_seq);
+            }
         }
 
         // Parse text region
@@ -1239,7 +1256,15 @@ pub fn stream_push_audio(
             state.prev_prefill_len = 0;
             state.stale_count = 0;
             state.prev_tail_snapshot.clear();
-            // Keep ALL encoder cache on degeneracy reset too — only reset decoder state.
+            // On degeneracy, keep 2 encoder windows like re-anchor
+            let keep_windows = 2.min(state.enc_cache.len());
+            let drop_windows = state.enc_cache.len() - keep_windows;
+            if drop_windows > 0 {
+                let drop_seq: usize = state.enc_cache[..drop_windows].iter().map(|w| w.seq_len).sum();
+                state.enc_cache_base_windows += drop_windows;
+                state.enc_cache.drain(..drop_windows);
+                state.enc_cached_seq_total = state.enc_cached_seq_total.saturating_sub(drop_seq);
+            }
         }
 
         // Dynamic re-anchor: trigger when encoder cache accumulates too many tokens,
@@ -1269,12 +1294,18 @@ pub fn stream_push_audio(
             state.prev_prefill_len = 0;
             state.stale_count = 0;
             state.prev_tail_snapshot.clear();
-            // Keep ALL encoder cache — mimic the official Qwen3-ASR streaming
-            // strategy where full accumulated audio is re-fed to the decoder each
-            // step. The decoder KV cache is reset (prev_prefill cleared above) so
-            // the next chunk will re-prefill from scratch with all encoder output +
-            // carry prefix tokens, breaking any decoder degeneracy while preserving
-            // complete audio context.
+            // Keep the 2 most recent encoder windows (~16s of context) to provide
+            // continuity across re-anchor boundaries. Dropping older windows prevents
+            // the decoder from attending to excessively long encoder sequences which
+            // causes degeneracy (repetition) in streaming mode.
+            let keep_windows = 2.min(state.enc_cache.len());
+            let drop_windows = state.enc_cache.len() - keep_windows;
+            if drop_windows > 0 {
+                let drop_seq: usize = state.enc_cache[..drop_windows].iter().map(|w| w.seq_len).sum();
+                state.enc_cache_base_windows += drop_windows;
+                state.enc_cache.drain(..drop_windows);
+                state.enc_cached_seq_total = state.enc_cached_seq_total.saturating_sub(drop_seq);
+            }
         }
     }
 
