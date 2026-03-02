@@ -282,7 +282,7 @@ impl QwenCtx {
                 encoder,
                 decoder: DecoderKind::BF16(decoder),
                 _safetensors: Some(ms),
-                _qint8: qf, // may be V1 qint8, kept for future use
+                _qint8: None,
                 model_dir: model_dir.to_string(),
                 kv_cache,
                 kv_initial_max_seq: 256,
