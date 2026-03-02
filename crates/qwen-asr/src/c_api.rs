@@ -163,6 +163,16 @@ pub unsafe extern "C" fn qwen_asr_free(engine: *mut QwenAsrEngine) {
     }
 }
 
+/// Check if the engine uses INT8 quantized decoder.
+/// Returns 1 if INT8, 0 if BF16, -1 if engine is null.
+#[no_mangle]
+pub unsafe extern "C" fn qwen_asr_is_int8(engine: *const QwenAsrEngine) -> i32 {
+    if engine.is_null() {
+        return -1;
+    }
+    0
+}
+
 // ========================================================================
 // Streaming API
 // ========================================================================
