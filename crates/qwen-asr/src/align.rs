@@ -3,7 +3,7 @@
 use crate::audio;
 use crate::config::*;
 use crate::context::QwenCtx;
-use crate::decoder::{self, tok_embed_bf16_to_f32};
+use crate::decoder::tok_embed_bf16_to_f32;
 use crate::kernels;
 use crate::tokenizer::QwenTokenizer;
 
@@ -256,7 +256,7 @@ pub fn forced_align(
     let total_seq = prefix_len + enc_seq_len + suffix_len + text_tokens.len();
 
     let mut input_embeds = vec![0.0f32; total_seq * dim];
-    let tok_emb = ctx.decoder.tok_embeddings_bf16;
+    let tok_emb = ctx.tok_embeddings_bf16();
 
     let mut off = 0;
     for &tok in PREFIX_HEAD {
@@ -297,10 +297,7 @@ pub fn forced_align(
     ctx.kv_cache.len = 0;
     ctx.kv_cache.shrink_to(ctx.kv_initial_max_seq);
 
-    let logits = decoder::decoder_prefill_logits(
-        &ctx.decoder, cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
-        &mut ctx.dec_bufs, &input_embeds, total_seq,
-    );
+    let logits = ctx.decoder_prefill_logits(&input_embeds, total_seq);
     let prefill_ms = elapsed_ms(t0);
 
     if kernels::verbose() >= 2 {

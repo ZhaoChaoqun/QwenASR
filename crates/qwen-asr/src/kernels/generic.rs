@@ -34,6 +34,20 @@ pub fn argmax_bf16_range(x: &[f32], w_bf16: *const u16, in_dim: usize, start: us
     (best, best_val)
 }
 
+/// INT8 per-channel quantized matrix-vector multiply.
+/// y[o] = scale[o] * sum_k(w_int8[o*in_dim+k] * x[k])
+pub fn int8_matvec_fused(y: &mut [f32], x: &[f32], w_int8: *const i8, scales: *const f32, in_dim: usize, out_dim: usize) {
+    for o in 0..out_dim {
+        let w_row = unsafe { std::slice::from_raw_parts(w_int8.add(o * in_dim), in_dim) };
+        let scale = unsafe { *scales.add(o) };
+        let mut sum = 0.0f32;
+        for k in 0..in_dim {
+            sum += (w_row[k] as f32) * x[k];
+        }
+        y[o] = sum * scale;
+    }
+}
+
 pub fn dot_f32(a: &[f32], b: &[f32], n: usize) -> f32 {
     let mut sum = 0.0f32;
     for i in 0..n {

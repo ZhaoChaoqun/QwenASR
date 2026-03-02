@@ -170,7 +170,10 @@ pub unsafe extern "C" fn qwen_asr_is_int8(engine: *const QwenAsrEngine) -> i32 {
     if engine.is_null() {
         return -1;
     }
-    0
+    match (*engine).ctx.decoder {
+        crate::context::DecoderKind::Int8(_) => 1,
+        crate::context::DecoderKind::BF16(_) => 0,
+    }
 }
 
 // ========================================================================

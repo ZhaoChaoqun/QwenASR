@@ -5,10 +5,17 @@ use crate::decoder::*;
 use crate::encoder::*;
 use crate::encoder::EncoderBuffers;
 use crate::kernels;
+use crate::quantize::QuantFile;
 use crate::safetensors::MultiSafetensors;
 use crate::tokenizer::QwenTokenizer;
 
 pub type TokenCallback = Box<dyn Fn(&str) + Send>;
+
+/// Wrapper enum for BF16 or INT8 decoder.
+pub enum DecoderKind {
+    BF16(Decoder),
+    Int8(DecoderInt8),
+}
 
 /// Top-level ASR engine state owning model weights, KV cache, and scratch buffers.
 ///
@@ -26,8 +33,9 @@ pub type TokenCallback = Box<dyn Fn(&str) + Send>;
 pub struct QwenCtx {
     pub config: QwenConfig,
     pub encoder: Encoder,
-    pub decoder: Decoder,
-    pub _safetensors: MultiSafetensors, // kept alive for mmap'd BF16 pointers
+    pub decoder: DecoderKind,
+    pub _safetensors: Option<MultiSafetensors>, // kept alive for mmap'd BF16 pointers
+    pub _qint8: Option<QuantFile>,              // kept alive for mmap'd INT8/BF16 pointers
     pub model_dir: String,
 
     // KV cache
@@ -74,94 +82,234 @@ pub struct QwenCtx {
 }
 
 impl QwenCtx {
+    /// Get the BF16 token embeddings pointer (works for both BF16 and INT8 decoder).
+    pub fn tok_embeddings_bf16(&self) -> *const u16 {
+        match &self.decoder {
+            DecoderKind::BF16(d) => d.tok_embeddings_bf16,
+            DecoderKind::Int8(d) => d.tok_embeddings_bf16,
+        }
+    }
+
+    /// Dispatch decoder prefill to BF16 or INT8 path.
+    pub fn decoder_prefill(&mut self, input_embeds: &[f32], seq_len: usize) {
+        let cfg = &self.config;
+        match &self.decoder {
+            DecoderKind::BF16(d) => {
+                decoder_prefill(d, cfg, &mut self.kv_cache, &mut self.rope_cache,
+                               &mut self.dec_bufs, input_embeds, seq_len);
+            }
+            DecoderKind::Int8(d) => {
+                decoder_prefill_int8(d, cfg, &mut self.kv_cache, &mut self.rope_cache,
+                                    &mut self.dec_bufs, input_embeds, seq_len);
+            }
+        }
+    }
+
+    /// Dispatch single-token decoder forward to BF16 or INT8 path.
+    pub fn decoder_forward(&mut self, input_embed: &[f32]) -> i32 {
+        let cfg = &self.config;
+        match &self.decoder {
+            DecoderKind::BF16(d) => {
+                decoder_forward(d, cfg, &mut self.kv_cache, &mut self.rope_cache,
+                               &mut self.dec_bufs, input_embed)
+            }
+            DecoderKind::Int8(d) => {
+                decoder_forward_int8(d, cfg, &mut self.kv_cache, &mut self.rope_cache,
+                                    &mut self.dec_bufs, input_embed)
+            }
+        }
+    }
+
+    /// Dispatch decoder prefill with logits (for forced aligner).
+    pub fn decoder_prefill_logits(&mut self, input_embeds: &[f32], seq_len: usize) -> Vec<f32> {
+        let cfg = &self.config;
+        match &self.decoder {
+            DecoderKind::BF16(d) => {
+                decoder_prefill_logits(d, cfg, &mut self.kv_cache, &mut self.rope_cache,
+                                      &mut self.dec_bufs, input_embeds, seq_len)
+            }
+            DecoderKind::Int8(d) => {
+                decoder_prefill_logits_int8(d, cfg, &mut self.kv_cache, &mut self.rope_cache,
+                                           &mut self.dec_bufs, input_embeds, seq_len)
+            }
+        }
+    }
+
     /// Load a Qwen3-ASR model from `model_dir`.
     ///
-    /// The directory must contain `model*.safetensors` and `vocab.json`.
-    /// Returns `None` if any required file is missing or malformed.
+    /// Supports three scenarios:
+    /// 1. V2 self-contained qint8 (no safetensors needed)
+    /// 2. V1 qint8 + safetensors (legacy)
+    /// 3. Pure BF16 safetensors (no qint8)
     ///
-    /// ```rust,no_run
-    /// use qwen_asr::context::QwenCtx;
-    /// let ctx = QwenCtx::load("qwen3-asr-0.6b").expect("failed to load");
-    /// ```
+    /// Returns `None` if any required file is missing or malformed.
     pub fn load(model_dir: &str) -> Option<Self> {
         if kernels::verbose() >= 1 {
             eprintln!("Loading model from {}", model_dir);
         }
 
-        let ms = MultiSafetensors::open(model_dir)?;
+        // Try to open qint8 file
+        let qint8_path = format!("{}/model_int8.qint8", model_dir);
+        let qf = QuantFile::open(&qint8_path);
 
-        // Detect model variant from tensor shapes
-        let info = crate::config::DetectInfo {
-            has_enc_layer_18: ms.has_tensor("thinker.audio_tower.layers.18.self_attn.q_proj.weight"),
-            lm_head_shape: ms.find("thinker.lm_head.weight").map(|(_, t)| t.shape.as_slice()),
-            embed_tokens_shape: ms.find("thinker.model.embed_tokens.weight").map(|(_, t)| t.shape.as_slice()),
-            gate_proj_shape: ms.find("thinker.model.layers.0.mlp.gate_proj.weight").map(|(_, t)| t.shape.as_slice()),
-        };
-        let cfg = QwenConfig::detect(&info);
+        let is_v2 = qf.as_ref().map_or(false, |q| q.is_self_contained());
 
-        if kernels::verbose() >= 1 {
-            let variant = if cfg.dec_hidden >= 2048 { "1.7B" } else { "0.6B" };
-            let model_type = if cfg.is_aligner() { "ForcedAligner" } else { "ASR" };
-            eprintln!("Detected: Qwen3-{}-{}", model_type, variant);
-            if cfg.is_aligner() {
-                eprintln!("  classify_num={}, timestamp_segment_time={:.0}ms",
-                          cfg.classify_num, cfg.timestamp_segment_time);
-                eprintln!("  encoder: {}d {}L, decoder: {}d {}L",
-                          cfg.enc_d_model, cfg.enc_layers, cfg.dec_hidden, cfg.dec_layers);
+        if is_v2 {
+            // ---- V2 self-contained: everything from qint8, no safetensors ----
+            let qf = qf.unwrap();
+            if kernels::verbose() >= 1 {
+                eprintln!("Found V2 self-contained qint8 (no safetensors needed)");
             }
+
+            // Detect config from qint8 tensor metadata
+            // Convert usize shapes to i64 for DetectInfo compatibility
+            let lm_head_shape_i64: Option<Vec<i64>> = qf.find("thinker.lm_head.weight")
+                .map(|t| t.shape.iter().map(|&s| s as i64).collect());
+            let embed_shape_i64: Option<Vec<i64>> = qf.find("thinker.model.embed_tokens.weight")
+                .map(|t| t.shape.iter().map(|&s| s as i64).collect());
+            let gate_shape_i64: Option<Vec<i64>> = qf.find("thinker.model.layers.0.mlp.gate_proj.weight")
+                .map(|t| t.shape.iter().map(|&s| s as i64).collect());
+            let info = crate::config::DetectInfo {
+                has_enc_layer_18: qf.has_tensor("thinker.audio_tower.layers.18.self_attn.q_proj.weight"),
+                lm_head_shape: lm_head_shape_i64.as_deref(),
+                embed_tokens_shape: embed_shape_i64.as_deref(),
+                gate_proj_shape: gate_shape_i64.as_deref(),
+            };
+            let cfg = QwenConfig::detect(&info);
+
+            if kernels::verbose() >= 1 {
+                let variant = if cfg.dec_hidden >= 2048 { "1.7B" } else { "0.6B" };
+                let model_type = if cfg.is_aligner() { "ForcedAligner" } else { "ASR" };
+                eprintln!("Detected: Qwen3-{}-{} (INT8)", model_type, variant);
+            }
+
+            // Load encoder from qint8
+            if kernels::verbose() >= 1 {
+                eprintln!("Loading encoder weights from qint8...");
+            }
+            let encoder = Encoder::load_from_qint8(&qf, &cfg)?;
+
+            // Load INT8 decoder from qint8
+            if kernels::verbose() >= 1 {
+                eprintln!("Loading INT8 decoder weights from qint8...");
+            }
+            let decoder_int8 = DecoderInt8::load(&qf, &cfg)?;
+
+            let kv_dim = cfg.dec_kv_heads * cfg.dec_head_dim;
+            let kv_cache = KvCache::new(cfg.dec_layers, 256, kv_dim);
+            let dec_bufs = DecoderBuffers::new(&cfg);
+
+            if kernels::verbose() >= 1 {
+                eprintln!("Model loaded (INT8 self-contained).");
+            }
+
+            Some(QwenCtx {
+                config: cfg,
+                encoder,
+                decoder: DecoderKind::Int8(decoder_int8),
+                _safetensors: None,
+                _qint8: Some(qf),
+                model_dir: model_dir.to_string(),
+                kv_cache,
+                kv_initial_max_seq: 256,
+                dec_bufs,
+                enc_bufs: EncoderBuffers::new(),
+                rope_cache: RopeCache::new(),
+                token_cb: None,
+                segment_sec: 0.0,
+                search_sec: 3.0,
+                stream_chunk_sec: 2.0,
+                stream_rollback: 5,
+                stream_unfixed_chunks: 2,
+                stream_max_new_tokens: 32,
+                past_text_conditioning: false,
+                skip_silence: false,
+                prompt: None,
+                force_language: None,
+                prompt_tokens: None,
+                force_prompt_tokens: None,
+                prompt_tokens_ready: false,
+                perf_total_ms: 0.0,
+                perf_text_tokens: 0,
+                perf_audio_ms: 0.0,
+                perf_encode_ms: 0.0,
+                perf_decode_ms: 0.0,
+            })
+        } else {
+            // ---- BF16 path: requires safetensors ----
+            let ms = MultiSafetensors::open(model_dir)?;
+
+            let info = crate::config::DetectInfo {
+                has_enc_layer_18: ms.has_tensor("thinker.audio_tower.layers.18.self_attn.q_proj.weight"),
+                lm_head_shape: ms.find("thinker.lm_head.weight").map(|(_, t)| t.shape.as_slice()),
+                embed_tokens_shape: ms.find("thinker.model.embed_tokens.weight").map(|(_, t)| t.shape.as_slice()),
+                gate_proj_shape: ms.find("thinker.model.layers.0.mlp.gate_proj.weight").map(|(_, t)| t.shape.as_slice()),
+            };
+            let cfg = QwenConfig::detect(&info);
+
+            if kernels::verbose() >= 1 {
+                let variant = if cfg.dec_hidden >= 2048 { "1.7B" } else { "0.6B" };
+                let model_type = if cfg.is_aligner() { "ForcedAligner" } else { "ASR" };
+                eprintln!("Detected: Qwen3-{}-{}", model_type, variant);
+                if cfg.is_aligner() {
+                    eprintln!("  classify_num={}, timestamp_segment_time={:.0}ms",
+                              cfg.classify_num, cfg.timestamp_segment_time);
+                    eprintln!("  encoder: {}d {}L, decoder: {}d {}L",
+                              cfg.enc_d_model, cfg.enc_layers, cfg.dec_hidden, cfg.dec_layers);
+                }
+            }
+
+            if kernels::verbose() >= 1 {
+                eprintln!("Loading encoder weights...");
+            }
+            let encoder = Encoder::load(&ms, &cfg)?;
+
+            if kernels::verbose() >= 1 {
+                eprintln!("Loading decoder weights...");
+            }
+            let decoder = Decoder::load(&ms, &cfg)?;
+
+            let kv_dim = cfg.dec_kv_heads * cfg.dec_head_dim;
+            let kv_cache = KvCache::new(cfg.dec_layers, 256, kv_dim);
+            let dec_bufs = DecoderBuffers::new(&cfg);
+
+            if kernels::verbose() >= 1 {
+                eprintln!("Model loaded.");
+            }
+
+            Some(QwenCtx {
+                config: cfg,
+                encoder,
+                decoder: DecoderKind::BF16(decoder),
+                _safetensors: Some(ms),
+                _qint8: qf, // may be V1 qint8, kept for future use
+                model_dir: model_dir.to_string(),
+                kv_cache,
+                kv_initial_max_seq: 256,
+                dec_bufs,
+                enc_bufs: EncoderBuffers::new(),
+                rope_cache: RopeCache::new(),
+                token_cb: None,
+                segment_sec: 0.0,
+                search_sec: 3.0,
+                stream_chunk_sec: 2.0,
+                stream_rollback: 5,
+                stream_unfixed_chunks: 2,
+                stream_max_new_tokens: 32,
+                past_text_conditioning: false,
+                skip_silence: false,
+                prompt: None,
+                force_language: None,
+                prompt_tokens: None,
+                force_prompt_tokens: None,
+                prompt_tokens_ready: false,
+                perf_total_ms: 0.0,
+                perf_text_tokens: 0,
+                perf_audio_ms: 0.0,
+                perf_encode_ms: 0.0,
+                perf_decode_ms: 0.0,
+            })
         }
-
-        // Load encoder
-        if kernels::verbose() >= 1 {
-            eprintln!("Loading encoder weights...");
-        }
-        let encoder = Encoder::load(&ms, &cfg)?;
-
-        // Load decoder
-        if kernels::verbose() >= 1 {
-            eprintln!("Loading decoder weights...");
-        }
-        let decoder = Decoder::load(&ms, &cfg)?;
-
-        let kv_dim = cfg.dec_kv_heads * cfg.dec_head_dim;
-        let kv_cache = KvCache::new(cfg.dec_layers, 256, kv_dim);
-        let dec_bufs = DecoderBuffers::new(&cfg);
-
-        if kernels::verbose() >= 1 {
-            eprintln!("Model loaded.");
-        }
-
-        Some(QwenCtx {
-            config: cfg,
-            encoder,
-            decoder,
-            _safetensors: ms,
-            model_dir: model_dir.to_string(),
-            kv_cache,
-            kv_initial_max_seq: 256,
-            dec_bufs,
-            enc_bufs: EncoderBuffers::new(),
-            rope_cache: RopeCache::new(),
-            token_cb: None,
-            segment_sec: 0.0,
-            search_sec: 3.0,
-            stream_chunk_sec: 2.0,
-            stream_rollback: 5,
-            stream_unfixed_chunks: 2,
-            stream_max_new_tokens: 32,
-            past_text_conditioning: false,
-            skip_silence: false,
-            prompt: None,
-            force_language: None,
-            prompt_tokens: None,
-            force_prompt_tokens: None,
-            prompt_tokens_ready: false,
-            perf_total_ms: 0.0,
-            perf_text_tokens: 0,
-            perf_audio_ms: 0.0,
-            perf_encode_ms: 0.0,
-            perf_decode_ms: 0.0,
-        })
     }
 
     /// Set an optional text prompt to guide transcription. Pass an empty string to clear.

@@ -3,7 +3,7 @@
 use crate::audio;
 use crate::config::*;
 use crate::context::QwenCtx;
-use crate::decoder::{self, tok_embed_bf16_to_f32};
+use crate::decoder::tok_embed_bf16_to_f32;
 use crate::kernels;
 use crate::tokenizer::QwenTokenizer;
 
@@ -108,7 +108,7 @@ fn transcribe_segment(
     let total_seq = prefix_len + enc_seq_len + suffix_len + n_past_prompt_tokens;
 
     let mut input_embeds = vec![0.0f32; total_seq * dim];
-    let tok_emb = ctx.decoder.tok_embeddings_bf16;
+    let tok_emb = ctx.tok_embeddings_bf16();
 
     // Embed prefix head
     let mut off = 0;
@@ -177,17 +177,11 @@ fn transcribe_segment(
     ctx.kv_cache.len = 0;
     ctx.kv_cache.shrink_to(ctx.kv_initial_max_seq);
     let prefill_len = total_seq - 1;
-    decoder::decoder_prefill(
-        &ctx.decoder, cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
-        &mut ctx.dec_bufs, &input_embeds, prefill_len,
-    );
+    ctx.decoder_prefill(&input_embeds, prefill_len);
 
     // First token from last prefill position
     let last_embed = &input_embeds[prefill_len * dim..(prefill_len + 1) * dim];
-    let mut token = decoder::decoder_forward(
-        &ctx.decoder, cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
-        &mut ctx.dec_bufs, last_embed,
-    );
+    let mut token = ctx.decoder_forward(last_embed);
 
     let prefill_ms = elapsed_ms(t0);
     if kernels::verbose() >= 2 {
@@ -224,10 +218,7 @@ fn transcribe_segment(
         }
 
         tok_embed_bf16_to_f32(&mut tmp_embed, tok_emb, token, dim);
-        token = decoder::decoder_forward(
-            &ctx.decoder, cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
-            &mut ctx.dec_bufs, &tmp_embed,
-        );
+        token = ctx.decoder_forward(&tmp_embed);
     }
 
     let decode_ms = elapsed_ms(t0);
@@ -486,7 +477,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
     let enc_window_frames = cfg.enc_n_window_infer.clamp(100, 800);
     let enc_window_samples = enc_window_frames * HOP_LENGTH;
 
-    let tok_emb = ctx.decoder.tok_embeddings_bf16;
+    let tok_emb = ctx.tok_embeddings_bf16();
 
     let mut raw_tokens: Vec<i32> = Vec::new();
     let mut stable_text_tokens: Vec<i32> = Vec::new();
@@ -647,19 +638,14 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         ctx.kv_cache.len = reused_prefill;
         let delta_prefill = prefill_len - reused_prefill;
         if delta_prefill > 0 {
-            decoder::decoder_prefill(
-                &ctx.decoder, &cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
-                &mut ctx.dec_bufs,
+            ctx.decoder_prefill(
                 &input_embeds[reused_prefill * dim..],
                 delta_prefill,
             );
         }
 
         let last_embed = &input_embeds[prefill_len * dim..(prefill_len + 1) * dim];
-        let mut token = decoder::decoder_forward(
-            &ctx.decoder, &cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
-            &mut ctx.dec_bufs, last_embed,
-        );
+        let mut token = ctx.decoder_forward(last_embed);
 
         // Save for next chunk
         prev_prefill_embeds = input_embeds[..prefill_len * dim].to_vec();
@@ -678,10 +664,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             if token == TOKEN_ENDOFTEXT || token == TOKEN_IM_END { break; }
             chunk_tokens.push(token);
             tok_embed_bf16_to_f32(&mut tmp_embed, tok_emb, token, dim);
-            token = decoder::decoder_forward(
-                &ctx.decoder, &cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
-                &mut ctx.dec_bufs, &tmp_embed,
-            );
+            token = ctx.decoder_forward(&tmp_embed);
         }
 
         let decode_ms = elapsed_ms(t0);
@@ -965,7 +948,7 @@ pub fn stream_push_audio(
 
     let enc_window_frames = cfg.enc_n_window_infer.clamp(100, 800);
     let enc_window_samples = enc_window_frames * HOP_LENGTH;
-    let tok_emb = ctx.decoder.tok_embeddings_bf16;
+    let tok_emb = ctx.tok_embeddings_bf16();
     let mut tmp_embed = vec![0.0f32; dim];
     let mut delta_bytes: Vec<u8> = Vec::new();
 
@@ -1135,19 +1118,14 @@ pub fn stream_push_audio(
     ctx.kv_cache.len = reused_prefill;
     let delta_prefill = prefill_len - reused_prefill;
     if delta_prefill > 0 {
-        decoder::decoder_prefill(
-            &ctx.decoder, &cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
-            &mut ctx.dec_bufs,
+        ctx.decoder_prefill(
             &input_embeds[reused_prefill * dim..],
             delta_prefill,
         );
     }
 
     let last_embed = &input_embeds[prefill_len * dim..(prefill_len + 1) * dim];
-    let mut token = decoder::decoder_forward(
-        &ctx.decoder, &cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
-        &mut ctx.dec_bufs, last_embed,
-    );
+    let mut token = ctx.decoder_forward(last_embed);
 
     // Save for next chunk
     state.prev_prefill_embeds = input_embeds[..prefill_len * dim].to_vec();
@@ -1173,10 +1151,7 @@ pub fn stream_push_audio(
         if token == TOKEN_ENDOFTEXT || token == TOKEN_IM_END { break; }
         chunk_tokens.push(token);
         tok_embed_bf16_to_f32(&mut tmp_embed, tok_emb, token, dim);
-        token = decoder::decoder_forward(
-            &ctx.decoder, &cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
-            &mut ctx.dec_bufs, &tmp_embed,
-        );
+        token = ctx.decoder_forward(&tmp_embed);
     }
 
     let decode_ms = elapsed_ms(t0);

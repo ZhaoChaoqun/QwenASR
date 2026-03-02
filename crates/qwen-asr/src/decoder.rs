@@ -2,6 +2,7 @@
 
 use crate::config::*;
 use crate::kernels;
+use crate::quantize::{QuantFile, QuantWeight, QuantWeightOwned};
 use crate::safetensors::MultiSafetensors;
 
 pub struct DecLayer {
@@ -632,4 +633,344 @@ pub fn tok_embed_bf16_to_f32(dst: &mut [f32], tok_emb_bf16: *const u16, token_id
     for i in 0..dim {
         dst[i] = f32::from_bits((src[i] as u32) << 16);
     }
+}
+
+// ========================================================================
+// INT8 Quantized Decoder
+// ========================================================================
+
+pub struct DecLayerInt8 {
+    pub wq: QuantWeight,
+    pub wk: QuantWeight,
+    pub wv: QuantWeight,
+    pub wo: QuantWeight,
+    pub q_norm_weight: Vec<f32>,
+    pub k_norm_weight: Vec<f32>,
+    pub input_norm: Vec<f32>,
+    pub post_attn_norm: Vec<f32>,
+    pub down: QuantWeight,
+    pub gate_up_fused: QuantWeightOwned, // interleaved gate+up INT8 data
+}
+
+unsafe impl Send for DecLayerInt8 {}
+unsafe impl Sync for DecLayerInt8 {}
+
+pub struct DecoderInt8 {
+    pub tok_embeddings_bf16: *const u16,
+    pub layers: Vec<DecLayerInt8>,
+    pub norm: Vec<f32>,
+    pub lm_head: Option<QuantWeight>,
+}
+
+unsafe impl Send for DecoderInt8 {}
+unsafe impl Sync for DecoderInt8 {}
+
+impl DecoderInt8 {
+    /// Load INT8 decoder from a V2 QuantFile.
+    pub fn load(qf: &QuantFile, cfg: &QwenConfig) -> Option<Self> {
+        let tok_embeddings_bf16 = qf.get_bf16_direct("thinker.model.embed_tokens.weight")?;
+
+        let mut layers = Vec::new();
+        for i in 0..cfg.dec_layers {
+            let lp = format!("thinker.model.layers.{}", i);
+
+            let wq = qf.get_quant_weight(&format!("{}.self_attn.q_proj.weight", lp))?;
+            let wk = qf.get_quant_weight(&format!("{}.self_attn.k_proj.weight", lp))?;
+            let wv = qf.get_quant_weight(&format!("{}.self_attn.v_proj.weight", lp))?;
+            let wo = qf.get_quant_weight(&format!("{}.self_attn.o_proj.weight", lp))?;
+
+            let q_norm = qf.get_f32(&format!("{}.self_attn.q_norm.weight", lp))?;
+            let k_norm = qf.get_f32(&format!("{}.self_attn.k_norm.weight", lp))?;
+            let input_norm = qf.get_f32(&format!("{}.input_layernorm.weight", lp))?;
+            let post_attn_norm = qf.get_f32(&format!("{}.post_attention_layernorm.weight", lp))?;
+
+            let gate = qf.get_quant_weight(&format!("{}.mlp.gate_proj.weight", lp))?;
+            let up = qf.get_quant_weight(&format!("{}.mlp.up_proj.weight", lp))?;
+            let down = qf.get_quant_weight(&format!("{}.mlp.down_proj.weight", lp))?;
+
+            // Fuse gate+up: interleave rows (same pattern as BF16 decoder)
+            let inter = cfg.dec_intermediate;
+            let hidden = cfg.dec_hidden;
+            let mut fused_data = vec![0i8; 2 * inter * hidden];
+            let mut fused_scales = vec![0.0f32; 2 * inter];
+            unsafe {
+                let gate_data = std::slice::from_raw_parts(gate.data, inter * hidden);
+                let up_data = std::slice::from_raw_parts(up.data, inter * hidden);
+                let gate_scales = std::slice::from_raw_parts(gate.scales, inter);
+                let up_scales = std::slice::from_raw_parts(up.scales, inter);
+                for r in 0..inter {
+                    fused_data[2 * r * hidden..(2 * r + 1) * hidden]
+                        .copy_from_slice(&gate_data[r * hidden..(r + 1) * hidden]);
+                    fused_data[(2 * r + 1) * hidden..(2 * r + 2) * hidden]
+                        .copy_from_slice(&up_data[r * hidden..(r + 1) * hidden]);
+                    fused_scales[2 * r] = gate_scales[r];
+                    fused_scales[2 * r + 1] = up_scales[r];
+                }
+            }
+
+            layers.push(DecLayerInt8 {
+                wq, wk, wv, wo,
+                q_norm_weight: q_norm,
+                k_norm_weight: k_norm,
+                input_norm,
+                post_attn_norm,
+                down,
+                gate_up_fused: QuantWeightOwned {
+                    data: fused_data,
+                    scales: fused_scales,
+                    out_dim: 2 * inter,
+                    in_dim: hidden,
+                },
+            });
+        }
+
+        let norm = qf.get_f32("thinker.model.norm.weight")?;
+
+        let lm_head = qf.get_quant_weight("thinker.lm_head.weight");
+
+        Some(DecoderInt8 {
+            tok_embeddings_bf16,
+            layers,
+            norm,
+            lm_head,
+        })
+    }
+}
+
+/// INT8 decoder prefill: process multiple tokens.
+pub fn decoder_prefill_int8(
+    decoder: &DecoderInt8,
+    cfg: &QwenConfig,
+    kv_cache: &mut KvCache,
+    rope: &mut RopeCache,
+    bufs: &mut DecoderBuffers,
+    input_embeds: &[f32],
+    seq_len: usize,
+) {
+    let dim = cfg.dec_hidden;
+    let n_heads = cfg.dec_heads;
+    let n_kv_heads = cfg.dec_kv_heads;
+    let head_dim = cfg.dec_head_dim;
+    let intermediate = cfg.dec_intermediate;
+    let eps = cfg.dec_rms_norm_eps;
+    let theta = cfg.dec_rope_theta;
+    let q_dim = n_heads * head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+
+    let needed = kv_cache.len + seq_len;
+    if needed > kv_cache.max_seq {
+        kv_cache.grow(needed + 1024);
+    }
+
+    bufs.ensure_prefill(seq_len, cfg);
+
+    let x = &mut bufs.pref_x[..seq_len * dim];
+    x.copy_from_slice(&input_embeds[..seq_len * dim]);
+
+    let start_pos = kv_cache.len;
+    rope.ensure(start_pos + seq_len, head_dim, theta);
+    let rope_cos = rope.cos_range(start_pos, seq_len);
+    let rope_sin = rope.sin_range(start_pos, seq_len);
+
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    for (layer_idx, layer) in decoder.layers.iter().enumerate() {
+        let x_norm = &mut bufs.pref_x_norm[..seq_len * dim];
+        kernels::rms_norm(x_norm, &bufs.pref_x[..seq_len * dim], &layer.input_norm, seq_len, dim, eps);
+
+        let q = &mut bufs.pref_q[..seq_len * q_dim];
+        let k = &mut bufs.pref_k[..seq_len * kv_dim];
+        let v = &mut bufs.pref_v[..seq_len * kv_dim];
+
+        kernels::linear_nobias_int8(q, x_norm, layer.wq.data, layer.wq.scales, seq_len, dim, q_dim);
+        kernels::linear_nobias_int8(k, x_norm, layer.wk.data, layer.wk.scales, seq_len, dim, kv_dim);
+        kernels::linear_nobias_int8(v, x_norm, layer.wv.data, layer.wv.scales, seq_len, dim, kv_dim);
+
+        kernels::rms_norm_per_head(q, &layer.q_norm_weight, seq_len, n_heads, head_dim, eps);
+        kernels::rms_norm_per_head(k, &layer.k_norm_weight, seq_len, n_kv_heads, head_dim, eps);
+
+        kernels::apply_rope_neox(q, rope_cos, rope_sin, seq_len, n_heads, head_dim);
+        kernels::apply_rope_neox(k, rope_cos, rope_sin, seq_len, n_kv_heads, head_dim);
+
+        for s in 0..seq_len {
+            kv_cache.k_at(layer_idx, start_pos + s)
+                .copy_from_slice(&bufs.pref_k[s * kv_dim..(s + 1) * kv_dim]);
+            kv_cache.v_at(layer_idx, start_pos + s)
+                .copy_from_slice(&bufs.pref_v[s * kv_dim..(s + 1) * kv_dim]);
+        }
+
+        let total_seq = start_pos + seq_len;
+        let full_k = kv_cache.k_layer_full(layer_idx, total_seq);
+        let full_v = kv_cache.v_layer_full(layer_idx, total_seq);
+
+        let attn_out = &mut bufs.pref_attn_out[..seq_len * q_dim];
+        kernels::causal_attention(attn_out, q, full_k, full_v,
+                                 seq_len, total_seq, n_heads, n_kv_heads,
+                                 head_dim, scale, start_pos);
+
+        let proj_out = &mut bufs.pref_proj_out[..seq_len * dim];
+        kernels::linear_nobias_int8(proj_out, attn_out, layer.wo.data, layer.wo.scales, seq_len, q_dim, dim);
+        kernels::add_inplace(&mut bufs.pref_x[..seq_len * dim], proj_out, seq_len * dim);
+
+        // Post-attention RMSNorm + SwiGLU MLP
+        let x_norm2 = &mut bufs.pref_x_norm[..seq_len * dim];
+        kernels::rms_norm(x_norm2, &bufs.pref_x[..seq_len * dim], &layer.post_attn_norm, seq_len, dim, eps);
+
+        let gu_ref = layer.gate_up_fused.as_ref();
+        let gate_up = &mut bufs.pref_gate_up[..seq_len * 2 * intermediate];
+        kernels::linear_nobias_int8(gate_up, x_norm2, gu_ref.data, gu_ref.scales, seq_len, dim, 2 * intermediate);
+
+        let gate = &mut bufs.pref_gate[..seq_len * intermediate];
+        kernels::swiglu_multiply(gate, gate_up, seq_len, intermediate);
+
+        let ffn_out = &mut bufs.pref_ffn_out[..seq_len * dim];
+        kernels::linear_nobias_int8(ffn_out, gate, layer.down.data, layer.down.scales, seq_len, intermediate, dim);
+        kernels::add_inplace(&mut bufs.pref_x[..seq_len * dim], ffn_out, seq_len * dim);
+    }
+
+    kv_cache.len = start_pos + seq_len;
+}
+
+/// INT8 decoder single-token forward: returns greedy token ID.
+pub fn decoder_forward_int8(
+    decoder: &DecoderInt8,
+    cfg: &QwenConfig,
+    kv_cache: &mut KvCache,
+    rope: &mut RopeCache,
+    bufs: &mut DecoderBuffers,
+    input_embed: &[f32],
+) -> i32 {
+    let dim = cfg.dec_hidden;
+    let n_heads = cfg.dec_heads;
+    let n_kv_heads = cfg.dec_kv_heads;
+    let head_dim = cfg.dec_head_dim;
+    let intermediate = cfg.dec_intermediate;
+    let eps = cfg.dec_rms_norm_eps;
+    let theta = cfg.dec_rope_theta;
+    let q_dim = n_heads * head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+
+    bufs.x[..dim].copy_from_slice(&input_embed[..dim]);
+
+    let pos = kv_cache.len;
+
+    if pos >= kv_cache.max_seq {
+        kv_cache.grow(pos + 1024);
+    }
+
+    rope.ensure(pos + 1, head_dim, theta);
+    let rope_cos = rope.cos_at(pos);
+    let rope_sin = rope.sin_at(pos);
+
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    for (layer_idx, layer) in decoder.layers.iter().enumerate() {
+        kernels::rms_norm(&mut bufs.x_norm[..dim], &bufs.x[..dim], &layer.input_norm, 1, dim, eps);
+
+        // INT8 Q/K/V matvec
+        kernels::linear_nobias_int8(&mut bufs.q[..q_dim], &bufs.x_norm[..dim],
+                                    layer.wq.data, layer.wq.scales, 1, dim, q_dim);
+        kernels::linear_nobias_int8(&mut bufs.k[..kv_dim], &bufs.x_norm[..dim],
+                                    layer.wk.data, layer.wk.scales, 1, dim, kv_dim);
+        kernels::linear_nobias_int8(&mut bufs.v[..kv_dim], &bufs.x_norm[..dim],
+                                    layer.wv.data, layer.wv.scales, 1, dim, kv_dim);
+
+        kernels::rms_norm_per_head(&mut bufs.q[..q_dim], &layer.q_norm_weight, 1, n_heads, head_dim, eps);
+        kernels::rms_norm_per_head(&mut bufs.k[..kv_dim], &layer.k_norm_weight, 1, n_kv_heads, head_dim, eps);
+
+        kernels::apply_rope_neox(&mut bufs.q[..q_dim], rope_cos, rope_sin, 1, n_heads, head_dim);
+        kernels::apply_rope_neox(&mut bufs.k[..kv_dim], rope_cos, rope_sin, 1, n_kv_heads, head_dim);
+
+        kv_cache.k_at(layer_idx, pos).copy_from_slice(&bufs.k[..kv_dim]);
+        kv_cache.v_at(layer_idx, pos).copy_from_slice(&bufs.v[..kv_dim]);
+
+        let total_seq = pos + 1;
+        let full_k = kv_cache.k_layer_full(layer_idx, total_seq);
+        let full_v = kv_cache.v_layer_full(layer_idx, total_seq);
+
+        kernels::causal_attention(&mut bufs.attn_out[..q_dim], &bufs.q[..q_dim],
+                                 full_k, full_v,
+                                 1, total_seq, n_heads, n_kv_heads,
+                                 head_dim, scale, pos);
+
+        kernels::linear_nobias_int8(&mut bufs.proj_out[..dim], &bufs.attn_out[..q_dim],
+                                    layer.wo.data, layer.wo.scales, 1, q_dim, dim);
+        kernels::add_inplace(&mut bufs.x[..dim], &bufs.proj_out[..dim], dim);
+
+        kernels::rms_norm(&mut bufs.x_norm[..dim], &bufs.x[..dim], &layer.post_attn_norm, 1, dim, eps);
+
+        let gu_ref = layer.gate_up_fused.as_ref();
+        kernels::linear_nobias_int8(&mut bufs.gate_buf[..2 * intermediate], &bufs.x_norm[..dim],
+                                    gu_ref.data, gu_ref.scales, 1, dim, 2 * intermediate);
+        // SwiGLU: gate_buf is interleaved [gate[0], up[0], gate[1], up[1], ...]
+        for j in 0..intermediate {
+            let g = bufs.gate_buf[2 * j];
+            let u = bufs.gate_buf[2 * j + 1];
+            let g_silu = g / (1.0 + (-g).exp());
+            bufs.ffn_out[j] = g_silu * u;
+        }
+        kernels::linear_nobias_int8(&mut bufs.gate_buf[..dim], &bufs.ffn_out[..intermediate],
+                                    layer.down.data, layer.down.scales, 1, intermediate, dim);
+        kernels::add_inplace(&mut bufs.x[..dim], &bufs.gate_buf[..dim], dim);
+    }
+
+    kv_cache.len = pos + 1;
+
+    // Final norm + streaming argmax
+    {
+        let tmp: Vec<f32> = bufs.x[..dim].to_vec();
+        kernels::rms_norm(&mut bufs.x[..dim], &tmp, &decoder.norm, 1, dim, eps);
+    }
+    // lm_head: use INT8 if available, otherwise fall back to BF16 embeddings argmax
+    let lm_out_dim = cfg.lm_head_dim();
+    if let Some(ref lm) = decoder.lm_head {
+        // INT8 lm_head: compute full logits and argmax
+        let mut logits = vec![0.0f32; lm_out_dim];
+        kernels::linear_nobias_int8(&mut logits, &bufs.x[..dim], lm.data, lm.scales, 1, dim, lm_out_dim);
+        let mut best = 0usize;
+        let mut best_val = logits[0];
+        for i in 1..lm_out_dim {
+            if logits[i] > best_val {
+                best_val = logits[i];
+                best = i;
+            }
+        }
+        best as i32
+    } else {
+        // Tied weights: lm_head = tok_embeddings (BF16)
+        kernels::argmax_matvec_bf16(&bufs.x[..dim], decoder.tok_embeddings_bf16, dim, lm_out_dim) as i32
+    }
+}
+
+/// INT8 decoder prefill that returns per-position logits (for forced aligner).
+pub fn decoder_prefill_logits_int8(
+    decoder: &DecoderInt8,
+    cfg: &QwenConfig,
+    kv_cache: &mut KvCache,
+    rope: &mut RopeCache,
+    bufs: &mut DecoderBuffers,
+    input_embeds: &[f32],
+    seq_len: usize,
+) -> Vec<f32> {
+    let dim = cfg.dec_hidden;
+    let eps = cfg.dec_rms_norm_eps;
+    let out_dim = cfg.lm_head_dim();
+
+    decoder_prefill_int8(decoder, cfg, kv_cache, rope, bufs, input_embeds, seq_len);
+
+    let x = &bufs.pref_x[..seq_len * dim];
+    let mut x_norm = vec![0.0f32; seq_len * dim];
+    kernels::rms_norm(&mut x_norm, x, &decoder.norm, seq_len, dim, eps);
+
+    let mut logits = vec![0.0f32; seq_len * out_dim];
+    if let Some(ref lm) = decoder.lm_head {
+        kernels::linear_nobias_int8(&mut logits, &x_norm, lm.data, lm.scales, seq_len, dim, out_dim);
+    } else {
+        kernels::linear_nobias_bf16_scratch(
+            &mut logits, &x_norm, decoder.tok_embeddings_bf16,
+            seq_len, dim, out_dim, &mut bufs.bf16_scratch,
+        );
+    }
+
+    logits
 }

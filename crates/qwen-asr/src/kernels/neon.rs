@@ -554,3 +554,96 @@ pub unsafe fn gelu_inplace(x: &mut [f32], n: usize) {
         i += 1;
     }
 }
+
+/// INT8 per-channel quantized matrix-vector multiply (NEON optimized).
+/// y[o] = scale[o] * sum_k(w_int8[o*in_dim+k] * x[k])
+///
+/// Uses i8→i16 widening + i16→i32 widening + i32→f32 conversion for accumulation.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn int8_matvec_fused(y: &mut [f32], x: &[f32], w_int8: *const i8, scales: *const f32, in_dim: usize, out_dim: usize) {
+    let mut o = 0usize;
+
+    // Process 2 output rows at a time
+    while o + 1 < out_dim {
+        let w0 = w_int8.add(o * in_dim);
+        let w1 = w_int8.add((o + 1) * in_dim);
+        let s0 = *scales.add(o);
+        let s1 = *scales.add(o + 1);
+
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+        let mut k = 0usize;
+
+        // Process 8 elements at a time: load 8xi8, widen to 2x4xi32, convert to f32, fma with x
+        while k + 8 <= in_dim {
+            let xv0 = vld1q_f32(x.as_ptr().add(k));
+            let xv1 = vld1q_f32(x.as_ptr().add(k + 4));
+
+            // Row 0
+            let w0_i8 = vld1_s8(w0.add(k));
+            let w0_i16 = vmovl_s8(w0_i8);
+            let w0_lo_i32 = vmovl_s16(vget_low_s16(w0_i16));
+            let w0_hi_i32 = vmovl_s16(vget_high_s16(w0_i16));
+            let w0_lo_f32 = vcvtq_f32_s32(w0_lo_i32);
+            let w0_hi_f32 = vcvtq_f32_s32(w0_hi_i32);
+            acc0 = vfmaq_f32(acc0, w0_lo_f32, xv0);
+            acc1 = vfmaq_f32(acc1, w0_hi_f32, xv1);
+
+            // Row 1
+            let w1_i8 = vld1_s8(w1.add(k));
+            let w1_i16 = vmovl_s8(w1_i8);
+            let w1_lo_i32 = vmovl_s16(vget_low_s16(w1_i16));
+            let w1_hi_i32 = vmovl_s16(vget_high_s16(w1_i16));
+            let w1_lo_f32 = vcvtq_f32_s32(w1_lo_i32);
+            let w1_hi_f32 = vcvtq_f32_s32(w1_hi_i32);
+            acc2 = vfmaq_f32(acc2, w1_lo_f32, xv0);
+            acc3 = vfmaq_f32(acc3, w1_hi_f32, xv1);
+
+            k += 8;
+        }
+
+        let mut sum0 = vaddvq_f32(vaddq_f32(acc0, acc1));
+        let mut sum1 = vaddvq_f32(vaddq_f32(acc2, acc3));
+
+        // Scalar tail
+        while k < in_dim {
+            sum0 += (*w0.add(k) as f32) * x[k];
+            sum1 += (*w1.add(k) as f32) * x[k];
+            k += 1;
+        }
+
+        y[o] = sum0 * s0;
+        y[o + 1] = sum1 * s1;
+        o += 2;
+    }
+
+    // Handle remaining odd row
+    while o < out_dim {
+        let w_row = w_int8.add(o * in_dim);
+        let scale = *scales.add(o);
+        let mut k = 0usize;
+
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        while k + 8 <= in_dim {
+            let xv0 = vld1q_f32(x.as_ptr().add(k));
+            let xv1 = vld1q_f32(x.as_ptr().add(k + 4));
+            let wi8 = vld1_s8(w_row.add(k));
+            let wi16 = vmovl_s8(wi8);
+            let wlo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(wi16)));
+            let whi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(wi16)));
+            acc0 = vfmaq_f32(acc0, wlo, xv0);
+            acc1 = vfmaq_f32(acc1, whi, xv1);
+            k += 8;
+        }
+        let mut sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+        while k < in_dim {
+            sum += (*w_row.add(k) as f32) * x[k];
+            k += 1;
+        }
+        y[o] = sum * scale;
+        o += 1;
+    }
+}

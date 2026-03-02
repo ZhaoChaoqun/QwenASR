@@ -60,6 +60,7 @@ pub mod safetensors;
 pub mod audio;
 pub mod tokenizer;
 pub mod kernels;
+pub mod quantize;
 pub mod encoder;
 pub mod decoder;
 pub mod context;

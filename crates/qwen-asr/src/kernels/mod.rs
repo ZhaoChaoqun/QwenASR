@@ -393,6 +393,14 @@ fn bf16_matvec_fused(y: &mut [f32], x: &[f32], w_bf16: *const u16, bias: Option<
     generic::bf16_matvec_fused(y, x, w_bf16, bias, in_dim, out_dim);
 }
 
+fn int8_matvec_fused(y: &mut [f32], x: &[f32], w_int8: *const i8, scales: *const f32, in_dim: usize, out_dim: usize) {
+    #[cfg(target_arch = "aarch64")]
+    { unsafe { neon::int8_matvec_fused(y, x, w_int8, scales, in_dim, out_dim); } return; }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    generic::int8_matvec_fused(y, x, w_int8, scales, in_dim, out_dim);
+}
+
 fn argmax_bf16_range(x: &[f32], w_bf16: *const u16, in_dim: usize, start: usize, end: usize) -> (usize, f32) {
     #[cfg(target_arch = "aarch64")]
     { return unsafe { neon::argmax_bf16_range(x, w_bf16, in_dim, start, end) }; }
@@ -608,6 +616,48 @@ fn bf16_matvec_threaded(y: &mut [f32], x: &[f32], w_bf16: *const u16, bias: Opti
 
         bf16_matvec_fused(y_local, x_local, w_local, bias_local, in_dim, end - start);
     });
+}
+
+/// Threaded INT8 matvec
+fn int8_matvec_threaded(y: &mut [f32], x: &[f32], w_int8: *const i8, scales: *const f32, in_dim: usize, out_dim: usize) {
+    let n_threads = get_num_threads();
+    if n_threads <= 1 {
+        int8_matvec_fused(y, x, w_int8, scales, in_dim, out_dim);
+        return;
+    }
+
+    let y_send = y.as_mut_ptr() as usize;
+    let x_send = x.as_ptr() as usize;
+    let w_send = w_int8 as usize;
+    let s_send = scales as usize;
+
+    parallel_for(|tid, nt| {
+        let chunk = (out_dim + nt - 1) / nt;
+        let start = tid * chunk;
+        let end = (start + chunk).min(out_dim);
+        if start >= end { return; }
+
+        let y_local = unsafe { std::slice::from_raw_parts_mut((y_send as *mut f32).add(start), end - start) };
+        let x_local = unsafe { std::slice::from_raw_parts(x_send as *const f32, in_dim) };
+        let w_local = unsafe { (w_send as *const i8).add(start * in_dim) };
+        let s_local = unsafe { (s_send as *const f32).add(start) };
+
+        int8_matvec_fused(y_local, x_local, w_local, s_local, in_dim, end - start);
+    });
+}
+
+/// INT8 quantized linear layer (no bias): y = scale * (W_int8 @ x)
+pub fn linear_nobias_int8(y: &mut [f32], x: &[f32], w_int8: *const i8, scales: *const f32, seq_len: usize, in_dim: usize, out_dim: usize) {
+    if seq_len == 1 {
+        int8_matvec_threaded(y, x, w_int8, scales, in_dim, out_dim);
+        return;
+    }
+    // Multi-token: process each token independently
+    for s in 0..seq_len {
+        let x_s = &x[s * in_dim..(s + 1) * in_dim];
+        let y_s = &mut y[s * out_dim..(s + 1) * out_dim];
+        int8_matvec_threaded(y_s, x_s, w_int8, scales, in_dim, out_dim);
+    }
 }
 
 pub fn linear_nobias_bf16(y: &mut [f32], x: &[f32], w_bf16: *const u16, seq_len: usize, in_dim: usize, out_dim: usize) {
