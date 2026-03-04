@@ -40,7 +40,10 @@ pub unsafe extern "C" fn qwen_asr_load_model(
     kernels::set_threads(threads);
 
     match QwenCtx::load(dir) {
-        Some(ctx) => Box::into_raw(Box::new(QwenAsrEngine { ctx })),
+        Some(mut ctx) => {
+            ctx.past_text_conditioning = true;
+            Box::into_raw(Box::new(QwenAsrEngine { ctx }))
+        },
         None => std::ptr::null_mut(),
     }
 }
@@ -243,12 +246,22 @@ pub unsafe extern "C" fn qwen_asr_stream_push(
     }
 
     // Call the Rust streaming API with the full accumulated buffer
-    match transcribe::stream_push_audio(
+    let result = transcribe::stream_push_audio(
         &mut eng.ctx,
         &s.audio_buf,
         &mut s.state,
         finalize != 0,
-    ) {
+    );
+
+    // Apply audio buffer trim if requested by re-anchor/degeneracy reset
+    if s.state.audio_trim_request > 0 {
+        let trim = s.state.audio_trim_request.min(s.audio_buf.len());
+        s.audio_buf.drain(..trim);
+        s.state.apply_audio_trim(trim);
+        s.state.audio_trim_request = 0;
+    }
+
+    match result {
         Some(delta) if !delta.is_empty() => match CString::new(delta) {
             Ok(cs) => cs.into_raw(),
             Err(_) => std::ptr::null_mut(),

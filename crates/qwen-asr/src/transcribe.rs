@@ -22,12 +22,8 @@ const STREAM_RESET_CARRY_TOKENS: usize = 24;
 const STREAM_MAX_ENC_WINDOWS: usize = 4;
 /// Dynamic re-anchor threshold: when total encoder sequence length (cached +
 /// partial) exceeds this value, trigger a re-anchor to reset decoder state.
-/// Re-anchor preserves the most recent 2 encoder windows (~16s of context)
-/// while dropping older ones, providing a balance between audio continuity
-/// and decoder stability.
-/// ~200 encoder tokens ≈ 15s of audio. With 2 windows kept (~208 tokens),
-/// re-anchor starts trimming at ~15s and the decoder always sees at least
-/// the last ~16s of context.
+/// ~200 encoder tokens ≈ 15s of audio. Re-anchor preserves the most recent
+/// encoder window (~8s of context) while dropping older ones.
 const STREAM_REANCHOR_ENC_SEQ_THRESHOLD: usize = 200;
 
 fn get_time_ms() -> f64 {
@@ -849,6 +845,13 @@ pub struct StreamState {
     // Tokenizer (loaded once)
     tokenizer: Option<QwenTokenizer>,
     prompt_prepared: bool,
+
+    /// Number of audio samples safe to trim from the front of the external buffer.
+    /// Set during re-anchor/degeneracy reset. Caller (c_api) should drain and adjust.
+    pub audio_trim_request: usize,
+    /// Encoder window size in samples (set on first stream_push_audio call).
+    /// Needed by apply_audio_trim to adjust enc_cache_base_windows.
+    enc_window_samples: usize,
 }
 
 impl StreamState {
@@ -872,6 +875,8 @@ impl StreamState {
             chunk_idx: 0,
             tokenizer: None,
             prompt_prepared: false,
+            audio_trim_request: 0,
+            enc_window_samples: 0,
         }
     }
 
@@ -892,6 +897,8 @@ impl StreamState {
         self.last_partial_seq = 0;
         self.audio_cursor = 0;
         self.chunk_idx = 0;
+        self.audio_trim_request = 0;
+        self.enc_window_samples = 0;
         // Keep tokenizer and prompt_prepared
     }
 
@@ -903,6 +910,18 @@ impl StreamState {
     /// Get how many samples have been processed so far.
     pub fn audio_cursor(&self) -> usize {
         self.audio_cursor
+    }
+
+    /// Adjust internal cursors after the caller trims audio samples from the buffer front.
+    pub fn apply_audio_trim(&mut self, trim: usize) {
+        self.audio_cursor = self.audio_cursor.saturating_sub(trim);
+        self.last_partial_cursor = self.last_partial_cursor.saturating_sub(trim);
+        // Adjust enc_cache_base_windows: trim removes samples from the front,
+        // so absolute window offsets must be reduced accordingly.
+        if self.enc_window_samples > 0 {
+            let trimmed_windows = trim / self.enc_window_samples;
+            self.enc_cache_base_windows = self.enc_cache_base_windows.saturating_sub(trimmed_windows);
+        }
     }
 
     /// Get currently decoded but not-yet-stable (speculative) text.
@@ -975,6 +994,7 @@ pub fn stream_push_audio(
 
     let enc_window_frames = cfg.enc_n_window_infer.clamp(100, 800);
     let enc_window_samples = enc_window_frames * HOP_LENGTH;
+    state.enc_window_samples = enc_window_samples; // store for apply_audio_trim
     let mut tmp_embed = vec![0.0f32; dim];
     let mut delta_bytes: Vec<u8> = Vec::new();
 
@@ -1183,177 +1203,294 @@ pub fn stream_push_audio(
     let decode_ms = elapsed_ms(t0);
     ctx.perf_decode_ms += decode_ms;
 
-    // ---- Detect speech end (decoder produced EOT on silence) ----
-    // When chunk_tokens is empty, the decoder saw silence/end-of-speech.
-    // Commit ALL remaining rollback-buffered tokens BEFORE truncation,
-    // since truncate will remove them.
-    let speech_ended = chunk_tokens.is_empty()
-        && !state.raw_tokens.is_empty()
-        && state.chunk_idx >= unfixed_chunks;
-
-    if speech_ended {
-        // Emit remaining rollback tokens from current raw_tokens (before truncation)
-        let text_start = if n_force_prompt_tokens == 0 {
-            state.raw_tokens.iter().position(|&t| t == TOKEN_ASR_TEXT)
-                .map(|p| p + 1)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let candidate_tokens = &state.raw_tokens[text_start..];
-        let n_text = candidate_tokens.len();
-        let emit_from = state.stable_text_tokens.len();
-        for i in emit_from..n_text {
-            if i < candidate_tokens.len() {
-                if i >= state.stable_text_tokens.len() {
-                    state.stable_text_tokens.push(candidate_tokens[i]);
-                }
-                let piece_bytes = tokenizer.decode_bytes(candidate_tokens[i]);
-                if let Some(ref cb) = ctx.token_cb {
-                    cb(&String::from_utf8_lossy(piece_bytes));
-                }
-                ctx.perf_text_tokens += 1;
-                state.result_bytes.extend_from_slice(piece_bytes);
-                delta_bytes.extend_from_slice(piece_bytes);
-            }
-        }
+    if kernels::verbose() >= 3 {
+        let tok_strs: Vec<String> = chunk_tokens.iter().map(|&t| {
+            let b = tokenizer.decode_bytes(t);
+            format!("{}:\"{}\"", t, String::from_utf8_lossy(b))
+        }).collect();
+        eprintln!("  [stream v3 chunk {}] decode: {:.0}ms, n_generated={}, chunk_tokens({})=[{}]",
+            state.chunk_idx, decode_ms, n_generated, chunk_tokens.len(), tok_strs.join(", "));
+        eprintln!("  [stream v3 chunk {}] n_prefix_tokens={}, raw_tokens_before_update(len={})=[{}]",
+            state.chunk_idx, n_prefix_tokens, state.raw_tokens.len(),
+            state.raw_tokens.iter().map(|&t| {
+                let b = tokenizer.decode_bytes(t);
+                format!("{}:\"{}\"", t, String::from_utf8_lossy(b))
+            }).collect::<Vec<_>>().join(", "));
     }
 
     // ---- Update raw token history ----
     state.raw_tokens.truncate(n_prefix_tokens);
     state.raw_tokens.extend_from_slice(&chunk_tokens);
 
+    if kernels::verbose() >= 3 {
+        let tok_strs: Vec<String> = state.raw_tokens.iter().map(|&t| {
+            let b = tokenizer.decode_bytes(t);
+            format!("{}:\"{}\"", t, String::from_utf8_lossy(b))
+        }).collect();
+        eprintln!("  [stream v3 chunk {}] raw_tokens_after_update(len={})=[{}]",
+            state.chunk_idx, state.raw_tokens.len(), tok_strs.join(", "));
+    }
+
     // ---- Streaming degeneracy detection ----
-    if !speech_ended {
-        if state.raw_tokens == state.prev_tail_snapshot {
-            state.stale_count += 1;
-        } else {
-            state.stale_count = 0;
-            state.prev_tail_snapshot = state.raw_tokens.clone();
-        }
-        let (best_reps, _) = stream_tail_repeat_blocks(&state.raw_tokens, STREAM_DEGEN_MAX_PERIOD);
-        let is_degen = state.stale_count >= STREAM_STALE_CHUNKS
-            || best_reps >= STREAM_DEGEN_MIN_REPEATS;
+    if state.raw_tokens == state.prev_tail_snapshot {
+        state.stale_count += 1;
+    } else {
+        state.stale_count = 0;
+        state.prev_tail_snapshot = state.raw_tokens.clone();
+    }
+    let (best_reps, _) = stream_tail_repeat_blocks(&state.raw_tokens, STREAM_DEGEN_MAX_PERIOD);
+    let is_degen = state.stale_count >= STREAM_STALE_CHUNKS
+        || best_reps >= STREAM_DEGEN_MIN_REPEATS;
 
-        if is_degen {
-            if kernels::verbose() >= 2 {
-                eprintln!("[stream degen] reset at chunk {} (stale={}, reps={})",
-                    state.chunk_idx, state.stale_count, best_reps);
-            }
-            let carry = state.stable_text_tokens.len().min(STREAM_RESET_CARRY_TOKENS);
-            let carry_start = state.stable_text_tokens.len() - carry;
-            state.raw_tokens.clear();
-            if carry > 0 {
-                state.raw_tokens.push(TOKEN_ASR_TEXT);
-                state.raw_tokens.extend_from_slice(&state.stable_text_tokens[carry_start..]);
-            }
-            // Align stable_text_tokens with the carry tokens now in raw_tokens,
-            // so that emit_from == carry and new tokens can be emitted after reset.
-            let carry_tokens: Vec<i32> = state.stable_text_tokens[carry_start..].to_vec();
-            state.stable_text_tokens.clear();
-            state.stable_text_tokens.extend_from_slice(&carry_tokens);
-            state.prev_prefill_embeds.clear();
-            state.prev_prefill_len = 0;
-            state.stale_count = 0;
-            state.prev_tail_snapshot.clear();
-            // On degeneracy, keep 1 encoder window like re-anchor
-            let keep_windows = 1.min(state.enc_cache.len());
-            let drop_windows = state.enc_cache.len() - keep_windows;
-            if drop_windows > 0 {
-                let drop_seq: usize = state.enc_cache[..drop_windows].iter().map(|w| w.seq_len).sum();
-                state.enc_cache_base_windows += drop_windows;
-                state.enc_cache.drain(..drop_windows);
-                state.enc_cached_seq_total = state.enc_cached_seq_total.saturating_sub(drop_seq);
-            }
+    if is_degen {
+        if kernels::verbose() >= 2 {
+            eprintln!("[stream degen] reset at chunk {} (stale={}, reps={})",
+                state.chunk_idx, state.stale_count, best_reps);
         }
-
-        // Dynamic re-anchor: trigger when encoder cache accumulates too many tokens,
-        // OR at fixed interval (whichever comes first).
-        // Use enc_seq_len (cached + partial) instead of just cached, since partial
-        // encoder output also contributes to decoder cross-attention length.
-        let should_reanchor = (state.chunk_idx > 0 && state.chunk_idx % STREAM_RESET_INTERVAL_CHUNKS == 0)
-            || enc_seq_len >= STREAM_REANCHOR_ENC_SEQ_THRESHOLD;
-        if should_reanchor {
-            if kernels::verbose() >= 2 {
-                eprintln!("[stream reanchor] at chunk {} (enc_seq={})",
-                    state.chunk_idx, enc_seq_len);
-            }
-            let carry = state.stable_text_tokens.len().min(STREAM_RESET_CARRY_TOKENS);
-            let carry_start = state.stable_text_tokens.len() - carry;
-            state.raw_tokens.clear();
-            if carry > 0 {
-                state.raw_tokens.push(TOKEN_ASR_TEXT);
-                state.raw_tokens.extend_from_slice(&state.stable_text_tokens[carry_start..]);
-            }
-            // Align stable_text_tokens with the carry tokens now in raw_tokens,
-            // so that emit_from == carry and new tokens can be emitted after re-anchor.
-            let carry_tokens: Vec<i32> = state.stable_text_tokens[carry_start..].to_vec();
-            state.stable_text_tokens.clear();
-            state.stable_text_tokens.extend_from_slice(&carry_tokens);
-            state.prev_prefill_embeds.clear();
-            state.prev_prefill_len = 0;
-            state.stale_count = 0;
-            state.prev_tail_snapshot.clear();
-            // Keep 1 most recent encoder window (~8s context). Keeping 2+ causes
-            // decoder degeneracy (repetition) because the decoder can't handle long
-            // encoder sequences with max_new_tokens=32 per chunk in streaming mode.
-            let keep_windows = 1.min(state.enc_cache.len());
-            let drop_windows = state.enc_cache.len() - keep_windows;
-            if drop_windows > 0 {
-                let drop_seq: usize = state.enc_cache[..drop_windows].iter().map(|w| w.seq_len).sum();
-                state.enc_cache_base_windows += drop_windows;
-                state.enc_cache.drain(..drop_windows);
-                state.enc_cached_seq_total = state.enc_cached_seq_total.saturating_sub(drop_seq);
-            }
+        let carry = state.stable_text_tokens.len().min(STREAM_RESET_CARRY_TOKENS);
+        let carry_start = state.stable_text_tokens.len() - carry;
+        if kernels::verbose() >= 3 {
+            let carry_strs: Vec<String> = state.stable_text_tokens[carry_start..].iter().map(|&t| {
+                let b = tokenizer.decode_bytes(t);
+                format!("{}:\"{}\"", t, String::from_utf8_lossy(b))
+            }).collect();
+            eprintln!("  [stream v3 degen] carry_tokens({})=[{}]",
+                carry, carry_strs.join(", "));
+            eprintln!("  [stream v3 degen] stable_text_tokens(len={}) before reset",
+                state.stable_text_tokens.len());
+        }
+        state.raw_tokens.clear();
+        if carry > 0 {
+            state.raw_tokens.push(TOKEN_ASR_TEXT);
+            state.raw_tokens.extend_from_slice(&state.stable_text_tokens[carry_start..]);
+        }
+        // Align stable_text_tokens with the carry tokens now in raw_tokens,
+        // so that emit_from == carry and new tokens can be emitted after reset.
+        let carry_tokens: Vec<i32> = state.stable_text_tokens[carry_start..].to_vec();
+        state.stable_text_tokens.clear();
+        state.stable_text_tokens.extend_from_slice(&carry_tokens);
+        state.prev_prefill_embeds.clear();
+        state.prev_prefill_len = 0;
+        state.stale_count = 0;
+        state.prev_tail_snapshot.clear();
+        // On degeneracy, keep 1 encoder window
+        let keep_windows = 1.min(state.enc_cache.len());
+        let drop_windows = state.enc_cache.len() - keep_windows;
+        if drop_windows > 0 {
+            let drop_seq: usize = state.enc_cache[..drop_windows].iter().map(|w| w.seq_len).sum();
+            state.enc_cache_base_windows += drop_windows;
+            state.enc_cache.drain(..drop_windows);
+            state.enc_cached_seq_total = state.enc_cached_seq_total.saturating_sub(drop_seq);
+        }
+        // Request audio buffer trim to prevent immediate re-trigger
+        let keep_samples = chunk_samples * 4; // ~8s context
+        if state.audio_cursor > keep_samples {
+            state.audio_trim_request = state.audio_cursor - keep_samples;
         }
     }
 
-    // ---- Parse text region and emit stable tokens (non-speech-ended case) ----
-    if !speech_ended {
-        let text_start = if n_force_prompt_tokens == 0 {
-            state.raw_tokens.iter().position(|&t| t == TOKEN_ASR_TEXT)
-                .map(|p| p + 1)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let n_text_tokens = state.raw_tokens.len().saturating_sub(text_start);
+    // Dynamic re-anchor: trigger when encoder cache accumulates too many tokens,
+    // OR at fixed interval (whichever comes first).
+    // Use enc_seq_len (cached + partial) instead of just cached, since partial
+    // encoder output also contributes to decoder cross-attention length.
+    let should_reanchor = (state.chunk_idx > 0 && state.chunk_idx % STREAM_RESET_INTERVAL_CHUNKS == 0)
+        || enc_seq_len >= STREAM_REANCHOR_ENC_SEQ_THRESHOLD;
+    if should_reanchor {
+        if kernels::verbose() >= 2 {
+            eprintln!("[stream reanchor] at chunk {} (enc_seq={})",
+                state.chunk_idx, enc_seq_len);
+        }
+        let carry = state.stable_text_tokens.len().min(STREAM_RESET_CARRY_TOKENS);
+        let carry_start = state.stable_text_tokens.len() - carry;
+        if kernels::verbose() >= 3 {
+            let carry_strs: Vec<String> = state.stable_text_tokens[carry_start..].iter().map(|&t| {
+                let b = tokenizer.decode_bytes(t);
+                format!("{}:\"{}\"", t, String::from_utf8_lossy(b))
+            }).collect();
+            eprintln!("  [stream v3 reanchor] carry_tokens({})=[{}]",
+                carry, carry_strs.join(", "));
+            eprintln!("  [stream v3 reanchor] stable_text_tokens(len={}) before reset, enc_windows={}, audio_cursor={}",
+                state.stable_text_tokens.len(), state.enc_cache.len(), state.audio_cursor);
+        }
+        state.raw_tokens.clear();
+        if carry > 0 {
+            state.raw_tokens.push(TOKEN_ASR_TEXT);
+            state.raw_tokens.extend_from_slice(&state.stable_text_tokens[carry_start..]);
+        }
+        // Align stable_text_tokens with the carry tokens now in raw_tokens,
+        // so that emit_from == carry and new tokens can be emitted after re-anchor.
+        let carry_tokens: Vec<i32> = state.stable_text_tokens[carry_start..].to_vec();
+        state.stable_text_tokens.clear();
+        state.stable_text_tokens.extend_from_slice(&carry_tokens);
+        state.prev_prefill_embeds.clear();
+        state.prev_prefill_len = 0;
+        state.stale_count = 0;
+        state.prev_tail_snapshot.clear();
+        // Keep 1 most recent encoder window (~8s context) on re-anchor.
+        // With threshold=400, encoder has ~4 windows; keeping 1 provides
+        // sufficient context for continuation while resetting decoder state.
+        let keep_windows = 1.min(state.enc_cache.len());
+        let drop_windows = state.enc_cache.len() - keep_windows;
+        if drop_windows > 0 {
+            let drop_seq: usize = state.enc_cache[..drop_windows].iter().map(|w| w.seq_len).sum();
+            state.enc_cache_base_windows += drop_windows;
+            state.enc_cache.drain(..drop_windows);
+            state.enc_cached_seq_total = state.enc_cached_seq_total.saturating_sub(drop_seq);
+        }
+        // Request audio buffer trim to prevent immediate re-trigger
+        let keep_samples = chunk_samples * 4; // ~8s context
+        if state.audio_cursor > keep_samples {
+            state.audio_trim_request = state.audio_cursor - keep_samples;
+        }
+    }
 
-        let candidate_len = if is_final {
-            n_text_tokens
-        } else if state.chunk_idx >= unfixed_chunks {
-            (n_text_tokens as i32 - rollback).max(0) as usize
-        } else {
-            0
-        };
+    // ---- Parse text region and emit stable tokens ----
+    let text_start = if n_force_prompt_tokens == 0 {
+        state.raw_tokens.iter().position(|&t| t == TOKEN_ASR_TEXT)
+            .map(|p| p + 1)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let n_text_tokens = state.raw_tokens.len().saturating_sub(text_start);
 
-        let candidate_tokens = &state.raw_tokens[text_start..];
-        let emit_from = state.stable_text_tokens.len();
-        let emit_to = candidate_len.max(emit_from);
+    let candidate_len = if is_final {
+        n_text_tokens
+    } else if state.chunk_idx >= unfixed_chunks {
+        (n_text_tokens as i32 - rollback).max(0) as usize
+    } else {
+        0
+    };
 
-        for i in emit_from..emit_to {
-            if i < candidate_tokens.len() {
-                if i >= state.stable_text_tokens.len() {
-                    state.stable_text_tokens.push(candidate_tokens[i]);
+    let candidate_tokens = &state.raw_tokens[text_start..];
+    let mut emit_from = state.stable_text_tokens.len();
+    let mut emit_to = candidate_len.max(emit_from);
+
+    if kernels::verbose() >= 3 {
+        let stable_strs: Vec<String> = state.stable_text_tokens.iter().map(|&t| {
+            let b = tokenizer.decode_bytes(t);
+            format!("{}:\"{}\"", t, String::from_utf8_lossy(b))
+        }).collect();
+        let cand_strs: Vec<String> = candidate_tokens.iter().map(|&t| {
+            let b = tokenizer.decode_bytes(t);
+            format!("{}:\"{}\"", t, String::from_utf8_lossy(b))
+        }).collect();
+        eprintln!("  [stream v3 chunk {}] stabilization: text_start={}, n_text_tokens={}, candidate_len={}, emit_from={}, emit_to={}, is_final={}",
+            state.chunk_idx, text_start, n_text_tokens, candidate_len, emit_from, emit_to, is_final);
+        eprintln!("  [stream v3 chunk {}] stable_text_tokens(len={})=[{}]",
+            state.chunk_idx, state.stable_text_tokens.len(), stable_strs.join(", "));
+        eprintln!("  [stream v3 chunk {}] candidate_tokens(len={})=[{}]",
+            state.chunk_idx, candidate_tokens.len(), cand_strs.join(", "));
+
+        // Position-by-position mismatch detection between stable and candidate
+        let cmp_len = state.stable_text_tokens.len().min(candidate_tokens.len());
+        let mut mismatch_count = 0;
+        for i in 0..cmp_len {
+            if state.stable_text_tokens[i] != candidate_tokens[i] {
+                if mismatch_count == 0 {
+                    eprintln!("  [stream v3 chunk {}] MISMATCH detected (stable vs candidate):", state.chunk_idx);
                 }
-                let piece_bytes = tokenizer.decode_bytes(candidate_tokens[i]);
-                if let Some(ref cb) = ctx.token_cb {
-                    cb(&String::from_utf8_lossy(piece_bytes));
-                }
-                ctx.perf_text_tokens += 1;
-                state.result_bytes.extend_from_slice(piece_bytes);
-                delta_bytes.extend_from_slice(piece_bytes);
+                let sb = tokenizer.decode_bytes(state.stable_text_tokens[i]);
+                let cb = tokenizer.decode_bytes(candidate_tokens[i]);
+                eprintln!("    pos {}: stable={}:\"{}\" (hex:{}) vs cand={}:\"{}\" (hex:{})",
+                    i,
+                    state.stable_text_tokens[i], String::from_utf8_lossy(sb),
+                    sb.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(""),
+                    candidate_tokens[i], String::from_utf8_lossy(cb),
+                    cb.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(""));
+                mismatch_count += 1;
+                if mismatch_count >= 10 { break; } // limit output
             }
         }
+        if mismatch_count == 0 && cmp_len > 0 {
+            eprintln!("  [stream v3 chunk {}] stable/candidate prefix match OK ({} positions)", state.chunk_idx, cmp_len);
+        }
+    }
+
+    // ---- Byte-level alignment after re-anchor ----
+    // Detect stable/candidate token mismatch caused by BPE re-tokenization
+    // after re-anchor, and realign emit_from using cumulative byte lengths.
+    if emit_from > 0 {
+        let cmp_len = emit_from.min(candidate_tokens.len());
+        let mut mismatch_pos = None;
+        for j in 0..cmp_len {
+            if j < state.stable_text_tokens.len()
+                && state.stable_text_tokens[j] != candidate_tokens[j]
+            {
+                mismatch_pos = Some(j);
+                break;
+            }
+        }
+        // Also detect when stable is longer than candidate (implicit mismatch)
+        if mismatch_pos.is_none() && state.stable_text_tokens.len() > candidate_tokens.len() {
+            mismatch_pos = Some(candidate_tokens.len());
+        }
+
+        if let Some(mm_pos) = mismatch_pos {
+            // Compute stable bytes up to mismatch position
+            let stable_bytes_to_mm: usize = state.stable_text_tokens[..mm_pos].iter()
+                .map(|&t| tokenizer.decode_bytes(t).len())
+                .sum();
+
+            // Find the candidate token position whose cumulative bytes >= stable_bytes_to_mm
+            let mut cum_bytes = 0usize;
+            let mut aligned_pos = candidate_tokens.len();
+            for j in 0..candidate_tokens.len() {
+                cum_bytes += tokenizer.decode_bytes(candidate_tokens[j]).len();
+                if cum_bytes >= stable_bytes_to_mm {
+                    aligned_pos = j + 1;
+                    break;
+                }
+            }
+            // Clamp to candidate_len (don't emit beyond rollback window)
+            aligned_pos = aligned_pos.min(candidate_tokens.len());
+
+            if kernels::verbose() >= 2 {
+                eprintln!("  [stream byte-align] chunk {}: mismatch@pos={}, stable_bytes_to_mm={}, aligned_pos={}, truncating stable {} -> {}",
+                    state.chunk_idx, mm_pos, stable_bytes_to_mm, aligned_pos,
+                    state.stable_text_tokens.len(), aligned_pos);
+            }
+
+            // Truncate stable_text_tokens to the byte-aligned position
+            // and rebuild from candidate tokens up to that point
+            state.stable_text_tokens.clear();
+            state.stable_text_tokens.extend_from_slice(&candidate_tokens[..aligned_pos]);
+
+            emit_from = aligned_pos;
+            emit_to = candidate_len.max(emit_from);
+        }
+    }
+
+    for i in emit_from..emit_to {
+        if i < candidate_tokens.len() {
+            if i >= state.stable_text_tokens.len() {
+                state.stable_text_tokens.push(candidate_tokens[i]);
+            }
+            let piece_bytes = tokenizer.decode_bytes(candidate_tokens[i]);
+            if let Some(ref cb) = ctx.token_cb {
+                cb(&String::from_utf8_lossy(piece_bytes));
+            }
+            ctx.perf_text_tokens += 1;
+            state.result_bytes.extend_from_slice(piece_bytes);
+            delta_bytes.extend_from_slice(piece_bytes);
+        }
+    }
+
+    if kernels::verbose() >= 3 && emit_from < emit_to {
+        let emitted: Vec<String> = (emit_from..emit_to)
+            .filter(|&i| i < candidate_tokens.len())
+            .map(|i| {
+                let b = tokenizer.decode_bytes(candidate_tokens[i]);
+                format!("{}:\"{}\"", candidate_tokens[i], String::from_utf8_lossy(b))
+            }).collect();
+        eprintln!("  [stream v3 chunk {}] EMITTED tokens({})=[{}]",
+            state.chunk_idx, emitted.len(), emitted.join(", "));
+        eprintln!("  [stream v3 chunk {}] result_text_so_far=\"{}\"",
+            state.chunk_idx, String::from_utf8_lossy(&state.result_bytes));
     }
 
         ctx.perf_total_ms += elapsed_ms(chunk_t0);
         state.chunk_idx += 1;
-
-        // Stop processing after speech ends — no point encoding more silence
-        if speech_ended {
-            break;
-        }
     } // end while loop
 
     Some(String::from_utf8_lossy(&delta_bytes).into_owned())
