@@ -752,14 +752,10 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             }
         }
 
-        // Parse text region
-        let text_start = if n_force_prompt_tokens == 0 {
-            raw_tokens.iter().position(|&t| t == TOKEN_ASR_TEXT)
-                .map(|p| p + 1)
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        // Parse text region (always skip past TOKEN_ASR_TEXT marker)
+        let text_start = raw_tokens.iter().position(|&t| t == TOKEN_ASR_TEXT)
+            .map(|p| p + 1)
+            .unwrap_or(0);
         let n_text_tokens = raw_tokens.len().saturating_sub(text_start);
 
         // Fixed frontier
@@ -1345,13 +1341,9 @@ pub fn stream_push_audio(
     }
 
     // ---- Parse text region and emit stable tokens ----
-    let text_start = if n_force_prompt_tokens == 0 {
-        state.raw_tokens.iter().position(|&t| t == TOKEN_ASR_TEXT)
-            .map(|p| p + 1)
-            .unwrap_or(0)
-    } else {
-        0
-    };
+    let text_start = state.raw_tokens.iter().position(|&t| t == TOKEN_ASR_TEXT)
+        .map(|p| p + 1)
+        .unwrap_or(0);
     let n_text_tokens = state.raw_tokens.len().saturating_sub(text_start);
 
     let candidate_len = if is_final {
