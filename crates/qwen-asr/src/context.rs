@@ -71,6 +71,7 @@ pub struct QwenCtx {
     pub stream_max_new_tokens: i32,
     pub past_text_conditioning: bool,
     pub skip_silence: bool,
+    pub use_gpu: bool,
 
     // Optional prompt/language
     pub prompt: Option<String>,
@@ -126,8 +127,10 @@ impl QwenCtx {
     pub fn encoder_forward(&mut self, mel: &[f32], mel_frames: usize) -> Option<(Vec<f32>, usize)> {
         #[cfg(feature = "metal")]
         {
-            if let Some(ref gpu_enc) = self.gpu_encoder {
-                return crate::encoder_gpu::encoder_forward_metal(gpu_enc, &self.config, mel, mel_frames);
+            if self.use_gpu {
+                if let Some(ref gpu_enc) = self.gpu_encoder {
+                    return crate::encoder_gpu::encoder_forward_metal(gpu_enc, &self.config, mel, mel_frames);
+                }
             }
         }
         let cfg = &self.config;
@@ -141,7 +144,7 @@ impl QwenCtx {
     pub fn decoder_prefill(&mut self, input_embeds: &[f32], seq_len: usize) {
         let cfg = &self.config;
         #[cfg(feature = "metal")]
-        {
+        if self.use_gpu {
             // Phase 4: Full GPU prefill (no per-layer round-trips)
             if let (Some(ref gpu_dec), Some(ref mut gpu_kv), Some(ref mut gpu_rope)) =
                 (&self.gpu_decoder, &mut self.gpu_kv_cache, &mut self.gpu_rope_cache)
@@ -508,6 +511,7 @@ impl QwenCtx {
                 stream_max_new_tokens: 32,
                 past_text_conditioning: false,
                 skip_silence: false,
+                use_gpu: true,
                 prompt: None,
                 force_language: None,
                 prompt_tokens: None,
@@ -686,6 +690,7 @@ impl QwenCtx {
                 stream_max_new_tokens: 32,
                 past_text_conditioning: false,
                 skip_silence: false,
+                use_gpu: true,
                 prompt: None,
                 force_language: None,
                 prompt_tokens: None,

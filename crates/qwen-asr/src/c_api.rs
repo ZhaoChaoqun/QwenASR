@@ -131,6 +131,14 @@ pub unsafe extern "C" fn qwen_asr_set_segment_sec(engine: *mut QwenAsrEngine, se
     }
 }
 
+/// Enable or disable GPU acceleration at runtime (1 = GPU, 0 = CPU-only).
+#[no_mangle]
+pub unsafe extern "C" fn qwen_asr_set_use_gpu(engine: *mut QwenAsrEngine, use_gpu: i32) {
+    if !engine.is_null() {
+        (*engine).ctx.use_gpu = use_gpu != 0;
+    }
+}
+
 /// Set language (e.g. "English", "Chinese"). Empty string = auto-detect.
 #[no_mangle]
 pub unsafe extern "C" fn qwen_asr_set_language(
