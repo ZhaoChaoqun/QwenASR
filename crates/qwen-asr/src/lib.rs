@@ -70,6 +70,16 @@ pub mod align;
 pub mod c_api;
 #[cfg(feature = "android")]
 pub mod jni_api;
+#[cfg(feature = "metal")]
+pub mod device;
+#[cfg(feature = "metal")]
+pub mod gpu_tensors;
+#[cfg(feature = "metal")]
+pub mod metal_ops;
+#[cfg(feature = "metal")]
+pub mod encoder_gpu;
+#[cfg(feature = "metal")]
+pub mod decoder_gpu;
 
 /// Returns a list of compile-time optimization flags enabled for this build.
 pub fn optimization_flags() -> Vec<&'static str> {

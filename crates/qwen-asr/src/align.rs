@@ -294,6 +294,10 @@ pub fn forced_align(
     let t0 = get_time_ms();
     ctx.kv_cache.len = 0;
     ctx.kv_cache.shrink_to(ctx.kv_initial_max_seq);
+    #[cfg(feature = "metal")]
+    if let Some(ref mut gpu_kv) = ctx.gpu_kv_cache {
+        gpu_kv.reset();
+    }
 
     let logits = ctx.decoder_prefill_logits(&input_embeds, total_seq);
     let prefill_ms = elapsed_ms(t0);

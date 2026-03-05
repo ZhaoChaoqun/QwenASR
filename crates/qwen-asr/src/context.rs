@@ -85,6 +85,18 @@ pub struct QwenCtx {
     pub perf_audio_ms: f64,
     pub perf_encode_ms: f64,
     pub perf_decode_ms: f64,
+
+    // GPU state (Metal acceleration)
+    #[cfg(feature = "metal")]
+    pub gpu_device: crate::device::ComputeDevice,
+    #[cfg(feature = "metal")]
+    pub gpu_encoder: Option<crate::encoder_gpu::EncoderGpuWeights>,
+    #[cfg(feature = "metal")]
+    pub gpu_decoder: Option<crate::decoder_gpu::DecoderGpuWeights>,
+    #[cfg(feature = "metal")]
+    pub gpu_kv_cache: Option<crate::decoder_gpu::GpuKvCache>,
+    #[cfg(feature = "metal")]
+    pub gpu_rope_cache: Option<crate::decoder_gpu::GpuRopeCache>,
 }
 
 impl QwenCtx {
@@ -108,8 +120,14 @@ impl QwenCtx {
         }
     }
 
-    /// Run encoder forward pass (dispatches BF16 or INT8).
+    /// Run encoder forward pass (dispatches to Metal GPU or CPU).
     pub fn encoder_forward(&mut self, mel: &[f32], mel_frames: usize) -> Option<(Vec<f32>, usize)> {
+        #[cfg(feature = "metal")]
+        {
+            if let Some(ref gpu_enc) = self.gpu_encoder {
+                return crate::encoder_gpu::encoder_forward_metal(gpu_enc, &self.config, mel, mel_frames);
+            }
+        }
         let cfg = &self.config;
         match &self.encoder {
             EncoderKind::BF16(enc) => enc.forward(cfg, mel, mel_frames, Some(&mut self.enc_bufs)),
@@ -117,9 +135,39 @@ impl QwenCtx {
         }
     }
 
-    /// Dispatch decoder prefill to BF16 or INT8 path.
+    /// Dispatch decoder prefill to BF16 or INT8 path (GPU-accelerated if available).
     pub fn decoder_prefill(&mut self, input_embeds: &[f32], seq_len: usize) {
         let cfg = &self.config;
+        #[cfg(feature = "metal")]
+        {
+            // Phase 4: Full GPU prefill (no per-layer round-trips)
+            if let (Some(ref gpu_dec), Some(ref mut gpu_kv), Some(ref mut gpu_rope)) =
+                (&self.gpu_decoder, &mut self.gpu_kv_cache, &mut self.gpu_rope_cache)
+            {
+                crate::decoder_gpu::decoder_prefill_full_gpu(
+                    gpu_dec, cfg, gpu_kv, gpu_rope,
+                    &mut self.kv_cache, &mut self.rope_cache,
+                    &mut self.dec_bufs, input_embeds, seq_len);
+                return;
+            }
+            // Fallback: partial GPU prefill (Phase 3)
+            if let Some(ref gpu_dec) = self.gpu_decoder {
+                match &self.decoder {
+                    DecoderKind::BF16(d) => {
+                        crate::decoder_gpu::decoder_prefill_gpu(
+                            gpu_dec, d, cfg, &mut self.kv_cache, &mut self.rope_cache,
+                            &mut self.dec_bufs, input_embeds, seq_len);
+                        return;
+                    }
+                    DecoderKind::Int8(d) => {
+                        crate::decoder_gpu::decoder_prefill_int8_gpu(
+                            gpu_dec, d, cfg, &mut self.kv_cache, &mut self.rope_cache,
+                            &mut self.dec_bufs, input_embeds, seq_len);
+                        return;
+                    }
+                }
+            }
+        }
         match &self.decoder {
             DecoderKind::BF16(d) => {
                 decoder_prefill(d, cfg, &mut self.kv_cache, &mut self.rope_cache,
@@ -145,6 +193,79 @@ impl QwenCtx {
                                     &mut self.dec_bufs, input_embed)
             }
         }
+    }
+
+    /// GPU-accelerated single-token forward from an embedding slice.
+    ///
+    /// Runs transformer layers on GPU, then final norm + LM head argmax on CPU.
+    /// Returns `None` if GPU is not available or forward fails.
+    #[cfg(feature = "metal")]
+    pub fn decoder_forward_gpu_embed(&mut self, input_embed: &[f32]) -> Option<i32> {
+        if let (Some(ref gpu_dec), Some(ref mut gpu_kv), Some(ref mut gpu_rope)) =
+            (&self.gpu_decoder, &mut self.gpu_kv_cache, &mut self.gpu_rope_cache)
+        {
+            match crate::decoder_gpu::decoder_forward_gpu(
+                gpu_dec, &self.config, gpu_kv, gpu_rope, &mut self.rope_cache, input_embed
+            ) {
+                Ok(hidden) => {
+                    let gpu_kv_len = gpu_kv.len;
+
+                    // Final RMS norm on CPU
+                    let dim = self.config.dec_hidden;
+                    let eps = self.config.dec_rms_norm_eps;
+                    let norm_weights = match &self.decoder {
+                        DecoderKind::BF16(d) => &d.norm,
+                        DecoderKind::Int8(d) => &d.norm,
+                    };
+                    let mut x_normed = vec![0.0f32; dim];
+                    kernels::rms_norm(&mut x_normed, &hidden, norm_weights, 1, dim, eps);
+
+                    // LM head argmax on CPU
+                    let lm_out_dim = self.config.lm_head_dim();
+                    let next_token = match &self.decoder {
+                        DecoderKind::BF16(d) => {
+                            let lm_weight = d.lm_head_bf16.unwrap_or(d.tok_embeddings_bf16);
+                            kernels::argmax_matvec_bf16(&x_normed, lm_weight, dim, lm_out_dim) as i32
+                        }
+                        DecoderKind::Int8(d) => {
+                            let lm = d.lm_head.as_ref().unwrap_or(&d.tok_embeddings);
+                            let mut logits = vec![0.0f32; lm_out_dim];
+                            kernels::linear_nobias_int8(&mut logits, &x_normed,
+                                                        lm.data, lm.scales, 1, dim, lm_out_dim);
+                            logits.iter().enumerate()
+                                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                                .map(|(i, _)| i as i32)
+                                .unwrap_or(0)
+                        }
+                    };
+
+                    // Keep CPU KV cache len in sync
+                    self.kv_cache.len = gpu_kv_len;
+                    return Some(next_token);
+                }
+                Err(e) => {
+                    eprintln!("[metal] GPU decode failed: {}, falling back to CPU", e);
+                }
+            }
+        }
+        None
+    }
+
+    /// Full GPU single-token decode: token_id in → next token_id out.
+    pub fn decoder_forward_token(&mut self, token_id: i32) -> i32 {
+        let dim = self.config.dec_hidden;
+        let mut tmp_embed = vec![0.0f32; dim];
+        self.tok_embed_to_f32(&mut tmp_embed, token_id, dim);
+
+        #[cfg(feature = "metal")]
+        {
+            if let Some(next) = self.decoder_forward_gpu_embed(&tmp_embed) {
+                return next;
+            }
+        }
+
+        // CPU fallback
+        self.decoder_forward(&tmp_embed)
     }
 
     /// Dispatch decoder prefill with logits (for forced aligner).
@@ -230,6 +351,78 @@ impl QwenCtx {
                 eprintln!("Model loaded (INT8 self-contained).");
             }
 
+            #[cfg(feature = "metal")]
+            let gpu_device = crate::device::ComputeDevice::best();
+
+            #[cfg(feature = "metal")]
+            let gpu_encoder = {
+                if let crate::device::ComputeDevice::Metal(ref dev) = gpu_device {
+                    if kernels::verbose() >= 1 {
+                        eprintln!("[metal] Uploading encoder weights to GPU...");
+                    }
+                    match crate::encoder_gpu::EncoderGpuWeights::from_encoder_int8(&encoder, &cfg, dev) {
+                        Ok(w) => {
+                            if kernels::verbose() >= 1 {
+                                eprintln!("[metal] Encoder weights uploaded.");
+                            }
+                            Some(w)
+                        }
+                        Err(e) => {
+                            eprintln!("[metal] Failed to upload encoder weights: {}, falling back to CPU", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            };
+
+            #[cfg(feature = "metal")]
+            let gpu_decoder = {
+                if let crate::device::ComputeDevice::Metal(ref dev) = gpu_device {
+                    if kernels::verbose() >= 1 {
+                        eprintln!("[metal] Uploading decoder weights to GPU...");
+                    }
+                    match crate::decoder_gpu::DecoderGpuWeights::from_decoder_int8(&decoder_int8, &cfg, dev) {
+                        Ok(w) => {
+                            if kernels::verbose() >= 1 {
+                                eprintln!("[metal] Decoder weights uploaded.");
+                            }
+                            Some(w)
+                        }
+                        Err(e) => {
+                            eprintln!("[metal] Failed to upload decoder weights: {}, falling back to CPU", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            };
+
+            #[cfg(feature = "metal")]
+            let (gpu_kv_cache, gpu_rope_cache) = {
+                if let (Some(_), crate::device::ComputeDevice::Metal(ref dev)) = (&gpu_decoder, &gpu_device) {
+                    match crate::decoder_gpu::GpuKvCache::new(
+                        cfg.dec_layers, cfg.dec_kv_heads, cfg.dec_head_dim, 2048, dev
+                    ) {
+                        Ok(kv) => {
+                            if kernels::verbose() >= 1 {
+                                eprintln!("[metal] GPU KV cache + RoPE cache initialized.");
+                            }
+                            let rope = crate::decoder_gpu::GpuRopeCache::new(dev, cfg.dec_head_dim);
+                            (Some(kv), Some(rope))
+                        }
+                        Err(e) => {
+                            eprintln!("[metal] Failed to create GPU KV cache: {}", e);
+                            (None, None)
+                        }
+                    }
+                } else {
+                    (None, None)
+                }
+            };
+
             Some(QwenCtx {
                 config: cfg,
                 encoder: EncoderKind::Int8(encoder),
@@ -261,6 +454,16 @@ impl QwenCtx {
                 perf_audio_ms: 0.0,
                 perf_encode_ms: 0.0,
                 perf_decode_ms: 0.0,
+                #[cfg(feature = "metal")]
+                gpu_device,
+                #[cfg(feature = "metal")]
+                gpu_encoder,
+                #[cfg(feature = "metal")]
+                gpu_decoder,
+                #[cfg(feature = "metal")]
+                gpu_kv_cache,
+                #[cfg(feature = "metal")]
+                gpu_rope_cache,
             })
         } else {
             // ---- BF16 path: requires safetensors ----
@@ -304,6 +507,78 @@ impl QwenCtx {
                 eprintln!("Model loaded.");
             }
 
+            #[cfg(feature = "metal")]
+            let gpu_device = crate::device::ComputeDevice::best();
+
+            #[cfg(feature = "metal")]
+            let gpu_encoder = {
+                if let crate::device::ComputeDevice::Metal(ref dev) = gpu_device {
+                    if kernels::verbose() >= 1 {
+                        eprintln!("[metal] Uploading encoder weights to GPU...");
+                    }
+                    match crate::encoder_gpu::EncoderGpuWeights::from_encoder(&encoder, &cfg, dev) {
+                        Ok(w) => {
+                            if kernels::verbose() >= 1 {
+                                eprintln!("[metal] Encoder weights uploaded.");
+                            }
+                            Some(w)
+                        }
+                        Err(e) => {
+                            eprintln!("[metal] Failed to upload encoder weights: {}, falling back to CPU", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            };
+
+            #[cfg(feature = "metal")]
+            let gpu_decoder = {
+                if let crate::device::ComputeDevice::Metal(ref dev) = gpu_device {
+                    if kernels::verbose() >= 1 {
+                        eprintln!("[metal] Uploading decoder weights to GPU...");
+                    }
+                    match crate::decoder_gpu::DecoderGpuWeights::from_decoder(&decoder, &cfg, dev) {
+                        Ok(w) => {
+                            if kernels::verbose() >= 1 {
+                                eprintln!("[metal] Decoder weights uploaded.");
+                            }
+                            Some(w)
+                        }
+                        Err(e) => {
+                            eprintln!("[metal] Failed to upload decoder weights: {}, falling back to CPU", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            };
+
+            #[cfg(feature = "metal")]
+            let (gpu_kv_cache, gpu_rope_cache) = {
+                if let (Some(_), crate::device::ComputeDevice::Metal(ref dev)) = (&gpu_decoder, &gpu_device) {
+                    match crate::decoder_gpu::GpuKvCache::new(
+                        cfg.dec_layers, cfg.dec_kv_heads, cfg.dec_head_dim, 2048, dev
+                    ) {
+                        Ok(kv) => {
+                            if kernels::verbose() >= 1 {
+                                eprintln!("[metal] GPU KV cache + RoPE cache initialized.");
+                            }
+                            let rope = crate::decoder_gpu::GpuRopeCache::new(dev, cfg.dec_head_dim);
+                            (Some(kv), Some(rope))
+                        }
+                        Err(e) => {
+                            eprintln!("[metal] Failed to create GPU KV cache: {}", e);
+                            (None, None)
+                        }
+                    }
+                } else {
+                    (None, None)
+                }
+            };
+
             Some(QwenCtx {
                 config: cfg,
                 encoder: EncoderKind::BF16(encoder),
@@ -335,6 +610,16 @@ impl QwenCtx {
                 perf_audio_ms: 0.0,
                 perf_encode_ms: 0.0,
                 perf_decode_ms: 0.0,
+                #[cfg(feature = "metal")]
+                gpu_device,
+                #[cfg(feature = "metal")]
+                gpu_encoder,
+                #[cfg(feature = "metal")]
+                gpu_decoder,
+                #[cfg(feature = "metal")]
+                gpu_kv_cache,
+                #[cfg(feature = "metal")]
+                gpu_rope_cache,
             })
         }
     }

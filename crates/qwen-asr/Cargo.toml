@@ -16,6 +16,8 @@ name = "qwen_asr"
 
 [dependencies]
 libc = "0.2"
+candle-core = { version = "0.9", optional = true, features = ["metal"] }
+candle-metal-kernels = { version = "0.9.2", optional = true }
 
 [package.metadata.docs.rs]
 no-default-features = true
@@ -24,6 +26,7 @@ no-default-features = true
 default = ["blas", "vdsp"]
 blas = []
 vdsp = []
+metal = ["dep:candle-core", "dep:candle-metal-kernels"]
 ios = []
 android = []
 macos-ffi = []

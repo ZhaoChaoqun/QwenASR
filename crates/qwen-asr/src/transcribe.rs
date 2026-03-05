@@ -175,6 +175,10 @@ fn transcribe_segment(
     let t0 = get_time_ms();
     ctx.kv_cache.len = 0;
     ctx.kv_cache.shrink_to(ctx.kv_initial_max_seq);
+    #[cfg(feature = "metal")]
+    if let Some(ref mut gpu_kv) = ctx.gpu_kv_cache {
+        gpu_kv.reset();
+    }
     let prefill_len = total_seq - 1;
     ctx.decoder_prefill(&input_embeds, prefill_len);
 
@@ -194,7 +198,6 @@ fn transcribe_segment(
     let mut past_asr_text = n_force_prompt_tokens > 0 || n_past > 0;
 
     let mut text_bytes: Vec<u8> = Vec::new();
-    let mut tmp_embed = vec![0.0f32; dim];
 
     while n_generated < max_tokens {
         n_generated += 1;
@@ -216,8 +219,8 @@ fn transcribe_segment(
             }
         }
 
-        ctx.tok_embed_to_f32(&mut tmp_embed, token, dim);
-        token = ctx.decoder_forward(&tmp_embed);
+        ctx.tok_embed_to_f32(&mut input_embeds[..dim], token, dim);
+        token = ctx.decoder_forward(&input_embeds[..dim]);
     }
 
     let decode_ms = elapsed_ms(t0);
@@ -479,7 +482,6 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
     let mut raw_tokens: Vec<i32> = Vec::new();
     let mut stable_text_tokens: Vec<i32> = Vec::new();
     let mut result_bytes: Vec<u8> = Vec::new();
-    let mut tmp_embed = vec![0.0f32; dim];
 
     let mut chunk_idx = 0i32;
     let mut audio_cursor = 0usize;
@@ -633,6 +635,10 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         }
 
         ctx.kv_cache.len = reused_prefill;
+        #[cfg(feature = "metal")]
+        if let Some(ref mut gpu_kv) = ctx.gpu_kv_cache {
+            gpu_kv.len = reused_prefill;
+        }
         let delta_prefill = prefill_len - reused_prefill;
         if delta_prefill > 0 {
             ctx.decoder_prefill(
@@ -655,6 +661,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         let t0 = get_time_ms();
         let mut chunk_tokens: Vec<i32> = Vec::new();
         let mut n_generated = 0;
+        let mut tmp_embed = vec![0.0f32; dim];
 
         while n_generated < max_new_tokens {
             n_generated += 1;
@@ -991,7 +998,6 @@ pub fn stream_push_audio(
     let enc_window_frames = cfg.enc_n_window_infer.clamp(100, 800);
     let enc_window_samples = enc_window_frames * HOP_LENGTH;
     state.enc_window_samples = enc_window_samples; // store for apply_audio_trim
-    let mut tmp_embed = vec![0.0f32; dim];
     let mut delta_bytes: Vec<u8> = Vec::new();
 
     // ---- Process full chunks, plus remainder if finalizing ----
@@ -1158,6 +1164,10 @@ pub fn stream_push_audio(
     }
 
     ctx.kv_cache.len = reused_prefill;
+    #[cfg(feature = "metal")]
+    if let Some(ref mut gpu_kv) = ctx.gpu_kv_cache {
+        gpu_kv.len = reused_prefill;
+    }
     let delta_prefill = prefill_len - reused_prefill;
     if delta_prefill > 0 {
         ctx.decoder_prefill(
@@ -1187,6 +1197,7 @@ pub fn stream_push_audio(
     let t0 = get_time_ms();
     let mut chunk_tokens: Vec<i32> = Vec::new();
     let mut n_generated = 0;
+    let mut tmp_embed = vec![0.0f32; dim];
 
     while n_generated < max_new_tokens {
         n_generated += 1;

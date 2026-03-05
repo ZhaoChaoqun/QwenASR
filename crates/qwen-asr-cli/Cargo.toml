@@ -18,5 +18,8 @@ qwen-asr = { version = "0.3.0", path = "../qwen-asr" }
 ureq = "2"
 ctrlc = "3"
 
+[features]
+metal = ["qwen-asr/metal"]
+
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-sys = "0.2"

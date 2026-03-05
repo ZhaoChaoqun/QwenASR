@@ -1,6 +1,6 @@
 # ASR Pipeline 量化对比评估报告 (Rust)
 
-*生成时间：2026-03-04 14:10*
+*生成时间：2026-03-04 21:46*
 *测试集：67 条音频（corpus.json + real_manifest.json）*
 *Pipeline：Qwen3-ASR (离线), Qwen3-ASR (流式)*
 *运行方式：Rust C API（libqwen_asr.dylib via ctypes）*
@@ -17,8 +17,8 @@
 
 | Pipeline | 平均 CER | CER=0 条数 | CER≤0.10 | CER≤0.20 | CER>0.20 | 总推理时长 | RTF |
 |----------|:-------:|:---------:|:-------:|:-------:|:-------:|:---------:|:---:|
-| Qwen3-ASR (离线) | 0.0576 | 36/67 | 52 | 63 | 4 | 40.6s | 0.096x |
-| Qwen3-ASR (流式) | 0.0553 | 35/67 | 53 | 64 | 3 | 83.7s | 0.199x |
+| Qwen3-ASR (离线) | 0.0571 | 36/67 | 52 | 63 | 4 | 32.8s | 0.078x |
+| Qwen3-ASR (流式) | 0.0562 | 34/67 | 53 | 64 | 3 | 64.9s | 0.154x |
 
 ---
 
@@ -37,13 +37,13 @@
 | mixed_zh_en | 1 | 0.000 | 0.000 |
 | punctuation | 3 | 0.069 | 0.069 |
 | real_aishell | 8 | 0.000 | 0.000 |
-| real_ascend_codeswitching | 9 | 0.138 | 0.104 |
-| real_codeswitching | 8 | 0.014 | 0.014 |
+| real_ascend_codeswitching | 9 | 0.138 | 0.108 |
+| real_codeswitching | 8 | 0.014 | 0.017 |
 | real_conversational | 3 | 0.027 | 0.027 |
 | real_wenetspeech | 10 | 0.095 | 0.102 |
 | speech_rate | 2 | 0.263 | 0.263 |
 | speech_trailing_silence | 1 | 0.000 | 0.000 |
-| technical_numbers | 1 | 0.067 | 0.033 |
+| technical_numbers | 1 | 0.033 | 0.033 |
 
 ---
 
@@ -56,7 +56,7 @@
 | 3 | mixed_01 | 0.000 | 0.000 | 我今天用Python写了一个API接口。 |
 | 4 | mixed_02 | 0.120 | 0.120 | MacBook Pro M3芯片性能提升了百分之40。 |
 | 5 | en_short_01 | 0.000 | 0.091 | Hello world. |
-| 6 | tech_num_01 | 0.067 | 0.033 | 服务器IP地址是192.168.1.100，端口号8080。 |
+| 6 | tech_num_01 | 0.033 | 0.033 | 服务器IP地址是192.168.1.100，端口号8080。 |
 | 7 | noise_01 | 0.000 | 0.000 | 你好。 |
 | 8 | dev_git_01 | 0.050 | 0.050 | 执行git commit，修复登录bug。 |
 | 9 | dev_swift_01 | 0.045 | 0.045 | 定义一个struct叫做UserModel。 |
@@ -96,7 +96,7 @@
 | 43 | ascend_cs_003 | 0.324 | 0.000 | 深圳啊，或者是上海这种比较大的城市，会有更多opportunity。 |
 | 44 | ascend_cs_004 | 0.357 | 0.357 | 嗯，I like hot pot。 |
 | 45 | ascend_cs_005 | 0.061 | 0.082 | 所以我的我的parents，我的妈妈是chemistry老师，and我的爸爸是history老师。 |
-| 46 | ascend_cs_006 | 0.123 | 0.123 | 那个玩basketball的，然后我有时候有时候会邀我的friends啊，一起打在就是after class的时候。 |
+| 46 | ascend_cs_006 | 0.123 | 0.158 | 那个玩basketball的，然后我有时候有时候会邀我的friends啊，一起打在就是after class的时候。 |
 | 47 | ascend_cs_008 | 0.043 | 0.043 | 然后呃，我也喜欢play basketball。 |
 | 48 | ascend_cs_009 | 0.200 | 0.200 | 然后刚忘了讲，你你是念什么major的？ |
 | 49 | ascend_cs_010 | 0.000 | 0.000 | 哦，我我在UG的时候念的是electrical engineering。 |
@@ -115,7 +115,7 @@
 | 62 | cs_edge_003 | 0.024 | 0.024 | 用Docker Compose部署了3个microservice到staging环境。 |
 | 63 | cs_edge_004 | 0.023 | 0.023 | 在GitHub上提了一个issue，关于performance optimization。 |
 | 64 | cs_edge_005 | 0.000 | 0.000 | 这个function的return type应该是Optional，而不是force unwrap。 |
-| 65 | cs_edge_006 | 0.000 | 0.000 | 用Xcode的Instruments做了一下profiling，发现CPU占用太高。 |
+| 65 | cs_edge_006 | 0.000 | 0.024 | 用Xcode的Instruments做了一下profiling，发现CPU占用太高。 |
 | 66 | cs_edge_007 | 0.000 | 0.000 | GraphQL的schema定义比RESTful API更灵活一些。 |
 | 67 | cs_edge_008 | 0.067 | 0.067 | CI pipeline跑了30分钟，还没通过unit test。 |
 
