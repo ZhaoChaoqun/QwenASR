@@ -388,6 +388,9 @@ impl GpuKvCache {
     }
 
     /// Download GPU KV cache data to CPU KV cache for CPU decode fallback.
+    ///
+    /// Uses `buffer.contents()` direct memcpy instead of Tensor API to avoid
+    /// creating ~56 temporary Tensor objects and associated RwLock/buffer pool overhead.
     pub fn sync_to_cpu(&self, cpu_kv: &mut KvCache) -> Result<()> {
         let total_seq = self.len;
         if total_seq == 0 { return Ok(()); }
@@ -399,30 +402,42 @@ impl GpuKvCache {
 
         let hd = self.head_dim;
         let n_kv = self.n_kv_heads;
+        let kv_dim = n_kv * hd;
+        let max_seq = self.max_seq;
+
+        // Ensure all GPU commands are completed before reading buffer contents.
+        // The prefill path's final to_device(Cpu) already triggers a sync, but
+        // we add an explicit wait for safety.
+        let metal_dev = self.device.as_metal_device()?;
+        metal_dev.wait_until_completed()?;
 
         for layer in 0..self.n_layers {
-            // Download K and V for this layer: [1, n_kv_heads, total_seq, head_dim]
-            let k_view = self.k[layer].narrow(2, 0, total_seq)?;
-            let v_view = self.v[layer].narrow(2, 0, total_seq)?;
+            // Extract raw Metal buffer from KV tensors.
+            // GPU layout: [1, n_kv_heads, max_seq, head_dim], contiguous F32.
+            // Physical offset for head h, seq s: h * max_seq * hd + s * hd
+            let (k_guard, _) = self.k[layer].storage_and_layout();
+            let (v_guard, _) = self.v[layer].storage_and_layout();
+            let k_ms = match &*k_guard { Storage::Metal(ms) => ms, _ => candle_core::bail!("sync_to_cpu: K not Metal") };
+            let v_ms = match &*v_guard { Storage::Metal(ms) => ms, _ => candle_core::bail!("sync_to_cpu: V not Metal") };
 
-            // contiguous() + download
-            let k_data = k_view.contiguous()?.to_device(&Device::Cpu)?
-                .to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-            let v_data = v_view.contiguous()?.to_device(&Device::Cpu)?
-                .to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            // StorageModeShared: contents() gives CPU-accessible pointer directly.
+            let k_ptr = k_ms.buffer().contents() as *const f32;
+            let v_ptr = v_ms.buffer().contents() as *const f32;
 
-            // k_data layout: [n_kv_heads, total_seq, head_dim] (batch dim squeezed by flatten)
-            // CPU KV cache layout: [total_seq, kv_dim] per layer, where kv_dim = n_kv_heads * head_dim
-            // (stored as contiguous rows of kv_dim)
-            let kv_dim = n_kv * hd;
-            for s in 0..total_seq {
-                for h in 0..n_kv {
-                    let gpu_off = h * total_seq * hd + s * hd;
-                    let cpu_off = (layer * cpu_kv.max_seq + s) * kv_dim + h * hd;
-                    cpu_kv.k[cpu_off..cpu_off + hd]
-                        .copy_from_slice(&k_data[gpu_off..gpu_off + hd]);
-                    cpu_kv.v[cpu_off..cpu_off + hd]
-                        .copy_from_slice(&v_data[gpu_off..gpu_off + hd]);
+            // Transpose from GPU [head, max_seq, hd] to CPU [seq, kv_dim] layout.
+            // CPU layout: cpu_kv.k[layer * max_seq_cpu * kv_dim + s * kv_dim + h * hd .. + hd]
+            let cpu_layer_off = layer * cpu_kv.max_seq * kv_dim;
+            unsafe {
+                for s in 0..total_seq {
+                    let cpu_row = cpu_layer_off + s * kv_dim;
+                    for h in 0..n_kv {
+                        let gpu_off = h * max_seq * hd + s * hd;
+                        let cpu_off = cpu_row + h * hd;
+                        std::ptr::copy_nonoverlapping(
+                            k_ptr.add(gpu_off), cpu_kv.k.as_mut_ptr().add(cpu_off), hd);
+                        std::ptr::copy_nonoverlapping(
+                            v_ptr.add(gpu_off), cpu_kv.v.as_mut_ptr().add(cpu_off), hd);
+                    }
                 }
             }
         }
