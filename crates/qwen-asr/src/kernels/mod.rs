@@ -787,7 +787,7 @@ pub fn matmul_t_bf16(c: &mut [f32], a: &[f32], b_bf16: *const u16, m: usize, k: 
 // 2D Convolution (im2col + BLAS sgemm)
 // ========================================================================
 
-fn im2col(input: &[f32], cols: &mut [f32], c_in: usize, h_in: usize, w_in: usize,
+pub fn im2col(input: &[f32], cols: &mut [f32], c_in: usize, h_in: usize, w_in: usize,
           kh: usize, kw: usize, stride: usize, padding: usize, h_out: usize, w_out: usize) {
     let col_len = h_out * w_out;
     for ic in 0..c_in {

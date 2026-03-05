@@ -2,7 +2,7 @@
 //!
 //! Mirrors the CPU [`Encoder::forward`] logic but executes linear layers, GELU,
 //! layer-norm, and softmax on the GPU via candle Tensors and Metal native kernels
-//! (CustomOp). Conv2D stem runs on CPU (small, constant-size work).
+//! (CustomOp). Conv2D stem: Conv1 on CPU, Conv2/Conv3 GEMM+GELU on GPU.
 
 use candle_core::{DType, Device, Result, Tensor};
 
@@ -37,7 +37,7 @@ pub struct EncLayerGpu {
 
 /// All encoder weights pre-uploaded to the Metal device.
 pub struct EncoderGpuWeights {
-    // Conv2D stem (kept as F32 slices — conv is done on CPU for now)
+    // Conv2D stem (kept as F32 slices — conv1 runs on CPU)
     pub conv1_weight: Vec<f32>,
     pub conv1_bias: Vec<f32>,
     pub conv2_weight: Vec<f32>,
@@ -60,6 +60,104 @@ pub struct EncoderGpuWeights {
     pub proj2_b: Tensor,
 
     pub device: Device,
+
+    /// Pre-allocated raw Metal buffers for GPU conv2/conv3 (None if not Metal).
+    pub raw_conv: Option<RawConvContext>,
+}
+
+// ---------------------------------------------------------------------------
+// Raw Metal buffers for GPU conv2/conv3 stem
+// ---------------------------------------------------------------------------
+
+use std::sync::Arc;
+use candle_core::MetalStorage;
+use candle_core::op::BackpropOp;
+use candle_core::Storage;
+use candle_metal_kernels::metal::Buffer;
+
+/// Pre-allocated Metal buffers for running Conv3 GEMM+GELU+transpose+projection on GPU.
+/// Conv1 and Conv2 remain on CPU. Per-chunk im2col/PE data is written into dynamically
+/// allocated buffers (cols_all/pe_all) so all chunks can be submitted in a single encoder.
+pub struct RawConvContext {
+    // Conv3 weight buffers on GPU (permanent)
+    conv3_w: Arc<Buffer>,      // [480, 4320] f32
+    conv3_b: Arc<Buffer>,      // [480]
+
+    // Ping-pong compute buffers (GEMM output / GELU input-output alternate)
+    conv_a: Arc<Buffer>,       // max(480 * spatial3, w3_max * d_model)
+    conv_b: Arc<Buffer>,       // same
+
+    // Transpose output
+    reshaped: Arc<Buffer>,     // [w3_max, conv_proj_dim]
+
+    // Per-chunk projected output
+    projected: Arc<Buffer>,    // [w3_max, d_model]
+
+    // Full sequence aggregation buffer
+    full_output: Arc<Buffer>,  // [max_total_tokens, d_model]
+    full_output_cap: usize,
+}
+
+impl RawConvContext {
+    pub fn new(
+        conv3_weight: &[f32],
+        conv3_bias: &[f32],
+        cfg: &QwenConfig,
+        device: &Device,
+    ) -> Result<Self> {
+        let metal_dev = device.as_metal_device()?;
+
+        let chunk_size = cfg.enc_chunk_size;
+        let d_model = cfg.enc_d_model;
+        let cpd = cfg.enc_conv_proj_dim; // 480 * 16 = 7680
+
+        // Compute max spatial sizes from chunk_size
+        let max_h1 = (128 + 2 - 3) / 2 + 1; // 64
+        let max_w1 = (chunk_size + 2 - 3) / 2 + 1;
+        let max_h2 = (max_h1 + 2 - 3) / 2 + 1; // 32
+        let max_w2 = (max_w1 + 2 - 3) / 2 + 1;
+        let max_h3 = (max_h2 + 2 - 3) / 2 + 1; // 16
+        let max_w3 = (max_w2 + 2 - 3) / 2 + 1;
+        let max_spatial3 = max_h3 * max_w3;
+
+        let patch3 = CONV_HIDDEN * 3 * 3; // 4320
+
+        // Upload conv3 weights
+        let conv3_w = metal_dev.new_buffer(CONV_HIDDEN * patch3, DType::F32, "enc_conv3_w")?;
+        unsafe {
+            let ptr = conv3_w.contents() as *mut f32;
+            std::ptr::copy_nonoverlapping(conv3_weight.as_ptr(), ptr, CONV_HIDDEN * patch3);
+        }
+        let conv3_b_buf = metal_dev.new_buffer(CONV_HIDDEN, DType::F32, "enc_conv3_b")?;
+        unsafe {
+            let ptr = conv3_b_buf.contents() as *mut f32;
+            std::ptr::copy_nonoverlapping(conv3_bias.as_ptr(), ptr, CONV_HIDDEN);
+        }
+
+        // Allocate scratch buffers
+        // conv_a/conv_b: large enough for both conv output and chunk projected output
+        let max_conv_size = (CONV_HIDDEN * max_spatial3).max(max_w3 * d_model);
+        let conv_a = metal_dev.new_buffer(max_conv_size, DType::F32, "enc_conv_a")?;
+        let conv_b = metal_dev.new_buffer(max_conv_size, DType::F32, "enc_conv_b")?;
+
+        let reshaped = metal_dev.new_buffer(max_w3 * cpd, DType::F32, "enc_reshaped")?;
+        let projected = metal_dev.new_buffer(max_w3 * d_model, DType::F32, "enc_projected")?;
+
+        // Full output: start with generous capacity (256 tokens typical max)
+        let init_cap = 256;
+        let full_output = metal_dev.new_buffer(init_cap * d_model, DType::F32, "enc_full_out")?;
+
+        Ok(RawConvContext {
+            conv3_w,
+            conv3_b: conv3_b_buf,
+            conv_a,
+            conv_b,
+            reshaped,
+            projected,
+            full_output,
+            full_output_cap: init_cap,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +220,7 @@ impl EncoderGpuWeights {
             proj1_b: upload_1d(&enc.proj1_bias, d, device)?,
             proj2_w: upload_2d(&enc.proj2_weight, cfg.enc_output_dim, d, device)?,
             proj2_b: upload_1d(&enc.proj2_bias, cfg.enc_output_dim, device)?,
+            raw_conv: RawConvContext::new(&enc.conv3_weight, &enc.conv3_bias, cfg, device).ok(),
             device: device.clone(),
         })
     }
@@ -185,6 +284,7 @@ impl EncoderGpuWeights {
             proj1_b: upload_1d(&enc.proj1_bias, d, device)?,
             proj2_w: dequant_upload(&enc.proj2, cfg.enc_output_dim, d, device)?,
             proj2_b: upload_1d(&enc.proj2_bias, cfg.enc_output_dim, device)?,
+            raw_conv: RawConvContext::new(&enc.conv3_weight, &enc.conv3_bias, cfg, device).ok(),
             device: device.clone(),
         })
     }
@@ -290,11 +390,10 @@ fn windowed_attention_gpu(
 
 /// Run the encoder forward pass with GPU acceleration.
 ///
-/// Conv2D stem runs on CPU (small, constant-size per chunk).
+/// Conv1 runs on CPU, Conv2/Conv3 GEMM+GELU on GPU via raw Metal buffers.
 /// Transformer layers run entirely on GPU — linear, layer-norm (Metal native
 /// kernel), GELU, and windowed bidirectional attention (including softmax via
-/// Metal native kernel). Only input upload and output download cross the
-/// GPU↔CPU boundary.
+/// Metal native kernel).
 pub fn encoder_forward_metal(
     weights: &EncoderGpuWeights,
     cfg: &QwenConfig,
@@ -308,6 +407,235 @@ pub fn encoder_forward_metal(
             None
         }
     }
+}
+
+/// Extract raw Metal buffer pointer from a Tensor.
+fn extract_enc_buf(tensor: &Tensor) -> &Buffer {
+    let (guard, _layout) = tensor.storage_and_layout();
+    let ms = match &*guard {
+        Storage::Metal(ms) => ms,
+        _ => panic!("extract_enc_buf: expected Metal storage"),
+    };
+    // SAFETY: buffer's lifetime is tied to the Tensor (via its Storage Arc),
+    // which we know lives as long as `weights`. The returned reference is
+    // used within the scope where `weights` is alive.
+    unsafe { &*(ms.buffer() as *const Buffer) }
+}
+
+/// Run Conv2D stem with Conv1+Conv2 on CPU, Conv3+transpose+projection+PE on GPU.
+/// Returns the full output as a GPU Tensor [total_tokens, d_model].
+fn conv_stem_gpu(
+    weights: &EncoderGpuWeights,
+    raw: &RawConvContext,
+    cfg: &QwenConfig,
+    mel: &[f32],
+    mel_frames: usize,
+    chunk_sizes: &[(usize, usize, usize)],
+    total_tokens: usize,
+) -> Result<Tensor> {
+    use candle_metal_kernels::{
+        BufferOffset, GemmDType,
+        call_mlx_gemm,
+        call_binary_contiguous, call_binary_strided,
+        unary::{call_unary_contiguous, call_unary_strided, call_copy2d, contiguous, strided, copy2d},
+    };
+
+    let d_model = cfg.enc_d_model;
+    let metal_dev = weights.device.as_metal_device()?;
+    let raw_device = metal_dev.device();
+    let kernels_lib = metal_dev.kernels();
+
+    // Ensure full_output buffer is large enough
+    if total_tokens > raw.full_output_cap {
+        candle_core::bail!("conv_stem_gpu: total_tokens {} exceeds full_output_cap {}", total_tokens, raw.full_output_cap);
+    }
+
+    let conv_out_w_buf = extract_enc_buf(&weights.conv_out_weight);
+    let n_chunks = chunk_sizes.len();
+    let patch3 = CONV_HIDDEN * 3 * 3; // 4320
+
+    // -----------------------------------------------------------------------
+    // Phase 1 (CPU): Run Conv1 + Conv2 + im2col + PE for ALL chunks.
+    // Write cols3/PE into one large contiguous buffer at per-chunk offsets
+    // so GPU can read all chunks without CPU/GPU data races.
+    // -----------------------------------------------------------------------
+    struct ChunkInfo {
+        w3: usize,
+        h3: usize,
+        spatial3: usize,
+        cpd: usize,
+        cols_offset: usize, // element offset into cols_all buffer
+        pe_offset: usize,   // element offset into pe_all buffer
+    }
+    let mut chunk_infos: Vec<ChunkInfo> = Vec::with_capacity(n_chunks);
+    let mut total_cols_elems = 0usize;
+    let mut total_pe_elems = 0usize;
+
+    for &(_start, _end, w3) in chunk_sizes {
+        let chunk_w = _end - _start;
+        let h1 = (128 + 2 - 3) / 2 + 1;
+        let w1 = (chunk_w + 2 - 3) / 2 + 1;
+        let h2 = (h1 + 2 - 3) / 2 + 1;
+        let _w2 = (w1 + 2 - 3) / 2 + 1;
+        let h3 = (h2 + 2 - 3) / 2 + 1;
+        let spatial3 = h3 * w3;
+        let cpd = CONV_HIDDEN * h3;
+        chunk_infos.push(ChunkInfo {
+            w3, h3, spatial3, cpd,
+            cols_offset: total_cols_elems,
+            pe_offset: total_pe_elems,
+        });
+        total_cols_elems += patch3 * spatial3;
+        total_pe_elems += w3 * d_model;
+    }
+
+    // Allocate combined buffers for all chunks' im2col/PE data
+    let cols_all = metal_dev.new_buffer(total_cols_elems, DType::F32, "enc_cols_all")?;
+    let pe_all = metal_dev.new_buffer(total_pe_elems, DType::F32, "enc_pe_all")?;
+
+    // CPU-side: compute Conv1+Conv2+im2col+PE for each chunk
+    for (idx, &(start, end, _w3)) in chunk_sizes.iter().enumerate() {
+        let ci = &chunk_infos[idx];
+        let chunk_w = end - start;
+
+        // Extract chunk mel
+        let mut chunk_mel = vec![0.0f32; 128 * chunk_w];
+        for m in 0..128 {
+            chunk_mel[m * chunk_w..(m + 1) * chunk_w]
+                .copy_from_slice(&mel[m * mel_frames + start..m * mel_frames + end]);
+        }
+
+        // Conv1 on CPU
+        let h1 = (128 + 2 - 3) / 2 + 1;
+        let w1 = (chunk_w + 2 - 3) / 2 + 1;
+        let mut c1 = vec![0.0f32; CONV_HIDDEN * h1 * w1];
+        kernels::conv2d(&mut c1, &chunk_mel, &weights.conv1_weight, Some(&weights.conv1_bias),
+                        1, CONV_HIDDEN, 128, chunk_w, 3, 3, 2, 1);
+        kernels::gelu(&mut c1, CONV_HIDDEN * h1 * w1);
+
+        // Conv2 on CPU
+        let h2 = (h1 + 2 - 3) / 2 + 1;
+        let w2 = (w1 + 2 - 3) / 2 + 1;
+        let mut c2 = vec![0.0f32; CONV_HIDDEN * h2 * w2];
+        kernels::conv2d(&mut c2, &c1, &weights.conv2_weight, Some(&weights.conv2_bias),
+                        CONV_HIDDEN, CONV_HIDDEN, h1, w1, 3, 3, 2, 1);
+        kernels::gelu(&mut c2, CONV_HIDDEN * h2 * w2);
+
+        // im2col → write to cols_all at chunk-specific offset
+        unsafe {
+            let cols_ptr = (cols_all.contents() as *mut f32).add(ci.cols_offset);
+            let cols_slice = std::slice::from_raw_parts_mut(cols_ptr, patch3 * ci.spatial3);
+            kernels::im2col(&c2, cols_slice, CONV_HIDDEN, h2, w2, 3, 3, 2, 1, ci.h3, ci.w3);
+        }
+
+        // PE → write to pe_all at chunk-specific offset
+        unsafe {
+            let pe_ptr = (pe_all.contents() as *mut f32).add(ci.pe_offset);
+            let pe_slice = std::slice::from_raw_parts_mut(pe_ptr, ci.w3 * d_model);
+            kernels::sinusoidal_pe(pe_slice, ci.w3, d_model);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2 (GPU): Submit ALL chunks in a single command encoder.
+    // Uses conv_a/conv_b as ping-pong intermediates (safe because commands
+    // execute sequentially within one encoder).
+    // -----------------------------------------------------------------------
+    {
+        let enc = metal_dev.command_encoder()?;
+        let mut token_offset = 0usize;
+
+        for ci in chunk_infos.iter() {
+            let w3 = ci.w3;
+            let spatial3 = ci.spatial3;
+            let cpd = ci.cpd;
+            let cols_byte_offset = ci.cols_offset * 4;
+            let pe_byte_offset = ci.pe_offset * 4;
+
+            // GEMM: conv3_w[480, 4320] @ cols3[4320, spatial3] → conv_b[480, spatial3]
+            call_mlx_gemm(
+                raw_device, &enc, kernels_lib, GemmDType::F32,
+                (1, CONV_HIDDEN, spatial3, patch3),
+                &[patch3, 1], 0, &raw.conv3_w,
+                &[spatial3, 1], cols_byte_offset, &cols_all,
+                &raw.conv_b,
+            ).map_err(candle_core::Error::wrap)?;
+
+            // Bias: conv_b + conv3_b → conv_a
+            call_binary_strided(
+                raw_device, &enc, kernels_lib, "badd_f32_strided", 4,
+                &[CONV_HIDDEN, spatial3],
+                BufferOffset::zero_offset(&raw.conv_b), &[spatial3, 1],
+                BufferOffset::zero_offset(&raw.conv3_b), &[1, 0],
+                &raw.conv_a,
+            ).map_err(candle_core::Error::wrap)?;
+
+            // GELU: conv_a → conv_b
+            call_unary_contiguous(
+                raw_device, &enc, kernels_lib,
+                contiguous::gelu::FLOAT,
+                4,
+                CONV_HIDDEN * spatial3,
+                BufferOffset::zero_offset(&raw.conv_a),
+                &raw.conv_b,
+            ).map_err(candle_core::Error::wrap)?;
+
+            // Transpose: [cpd, w3] → [w3, cpd]
+            call_unary_strided(
+                raw_device, &enc, kernels_lib,
+                strided::copy::FLOAT,
+                &[w3, cpd],
+                BufferOffset::zero_offset(&raw.conv_b),
+                &[1, w3],
+                BufferOffset::zero_offset(&raw.reshaped),
+            ).map_err(candle_core::Error::wrap)?;
+
+            // Linear projection: reshaped[w3, cpd] @ conv_out_w^T → projected[w3, d_model]
+            call_mlx_gemm(
+                raw_device, &enc, kernels_lib, GemmDType::F32,
+                (1, w3, d_model, cpd),
+                &[cpd, 1], 0, &raw.reshaped,
+                &[1, cpd], 0, conv_out_w_buf,
+                &raw.projected,
+            ).map_err(candle_core::Error::wrap)?;
+
+            // Add PE: projected + pe → conv_a (temp)
+            call_binary_contiguous(
+                raw_device, &enc, kernels_lib, "badd_f32", 4,
+                w3 * d_model,
+                BufferOffset::zero_offset(&raw.projected),
+                BufferOffset { buffer: &pe_all, offset_in_bytes: pe_byte_offset },
+                &raw.conv_a,
+            ).map_err(candle_core::Error::wrap)?;
+
+            // Copy to full_output at correct offset
+            let dst_offset_bytes = token_offset * d_model * 4;
+            call_copy2d(
+                raw_device, &enc, kernels_lib, copy2d::FLOAT,
+                &raw.conv_a, &raw.full_output,
+                1, w3 * d_model,
+                w3 * d_model, w3 * d_model,
+                0, dst_offset_bytes,
+            ).map_err(candle_core::Error::wrap)?;
+
+            token_offset += w3;
+        }
+
+        drop(enc);
+    }
+
+    // Single sync for all chunks
+    metal_dev.wait_until_completed()?;
+
+    // Wrap full_output buffer as a Tensor for transformer layers
+    let metal_storage = MetalStorage::new(
+        raw.full_output.clone(),
+        metal_dev.clone(),
+        total_tokens * d_model,
+        DType::F32,
+    );
+    let storage = Storage::Metal(metal_storage);
+    Ok(Tensor::from_storage(storage, &[total_tokens, d_model], BackpropOp::none(), false))
 }
 
 fn encoder_forward_metal_inner(
@@ -347,12 +675,90 @@ fn encoder_forward_metal_inner(
     }
 
     // -----------------------------------------------------------------------
-    // Conv2D stem on CPU (small, constant-size per chunk)
+    // Conv2D stem: try GPU path, fall back to CPU path
     // -----------------------------------------------------------------------
+    let mut x = if let Some(ref raw_conv) = weights.raw_conv {
+        match conv_stem_gpu(weights, raw_conv, cfg, mel, mel_frames, &chunk_sizes, total_tokens) {
+            Ok(tensor) => tensor,
+            Err(_e) => {
+                // Fall back to CPU conv stem
+                conv_stem_cpu(weights, cfg, mel, mel_frames, &chunk_sizes, total_tokens, d_model)?
+            }
+        }
+    } else {
+        conv_stem_cpu(weights, cfg, mel, mel_frames, &chunk_sizes, total_tokens, d_model)?
+    };
+
+    // Build attention window boundaries
+    let window_token_size = tokens_per_chunk * (n_window_infer / chunk_size);
+    let n_windows = (total_tokens + window_token_size - 1) / window_token_size;
+    let mut window_starts_usize = vec![0usize; n_windows + 1];
+    for w in 0..n_windows {
+        window_starts_usize[w] = w * window_token_size;
+    }
+    window_starts_usize[n_windows] = total_tokens;
+
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    // -----------------------------------------------------------------------
+    // Transformer layers
+    // -----------------------------------------------------------------------
+    for layer in &weights.layers {
+        // --- Self-attention ---
+        let x_norm = layer_norm_gpu(&x, &layer.attn_norm_w, &layer.attn_norm_b, 1e-5)?;
+
+        let q_gpu = linear(&x_norm, &layer.wq, &layer.wq_bias)?;
+        let k_gpu = linear(&x_norm, &layer.wk, &layer.wk_bias)?;
+        let v_gpu = linear(&x_norm, &layer.wv, &layer.wv_bias)?;
+
+        let attn_out = windowed_attention_gpu(
+            &q_gpu, &k_gpu, &v_gpu,
+            n_heads, head_dim, scale,
+            &window_starts_usize, n_windows,
+        )?;
+
+        let proj = linear(&attn_out, &layer.wo, &layer.wo_bias)?;
+        x = x.add(&proj)?;
+
+        // --- FFN ---
+        let x_norm2 = layer_norm_gpu(&x, &layer.ffn_norm_w, &layer.ffn_norm_b, 1e-5)?;
+        let ffn_up = linear(&x_norm2, &layer.fc1, &layer.fc1_bias)?;
+        let ffn_act = ffn_up.gelu_erf()?;
+        let ffn_down = linear(&ffn_act, &layer.fc2, &layer.fc2_bias)?;
+        x = x.add(&ffn_down)?;
+    }
+
+    // -----------------------------------------------------------------------
+    // Final post-processing
+    // -----------------------------------------------------------------------
+    let x_normed = layer_norm_gpu(&x, &weights.ln_post_w, &weights.ln_post_b, 1e-5)?;
+    let proj1 = linear(&x_normed, &weights.proj1_w, &weights.proj1_b)?;
+    let proj1_act = proj1.gelu_erf()?;
+    let enc_output = linear(&proj1_act, &weights.proj2_w, &weights.proj2_b)?;
+
+    // Copy final output back to CPU
+    let output_cpu = enc_output.to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?.to_vec1::<f32>()?;
+
+    Ok((output_cpu, total_tokens))
+}
+
+/// CPU fallback for conv stem (original implementation).
+fn conv_stem_cpu(
+    weights: &EncoderGpuWeights,
+    _cfg: &QwenConfig,
+    mel: &[f32],
+    mel_frames: usize,
+    chunk_sizes: &[(usize, usize, usize)],
+    total_tokens: usize,
+    d_model: usize,
+) -> Result<Tensor> {
+    let dev = &weights.device;
     let mut x_cpu = vec![0.0f32; total_tokens * d_model];
     let mut token_offset = 0;
 
-    for &(start, end, w3) in &chunk_sizes {
+    for &(start, end, w3) in chunk_sizes {
         let chunk_w = end - start;
 
         // Extract chunk mel: [128, chunk_w]
@@ -400,14 +806,14 @@ fn encoder_forward_metal_inner(
 
         // Project [w3, conv_proj_dim] -> [w3, d_model] on GPU
         let reshaped_t = Tensor::from_slice(&reshaped, &[w3, cpd_actual], &Device::Cpu)
-            ?.to_device(&weights.device)?;
+            ?.to_device(dev)?;
         let projected = linear_nobias(&reshaped_t, &weights.conv_out_weight)?;
 
         // Add sinusoidal PE (computed on CPU, then added on GPU)
         let mut pe = vec![0.0f32; w3 * d_model];
         kernels::sinusoidal_pe(&mut pe, w3, d_model);
         let pe_t = Tensor::from_slice(&pe, &[w3, d_model], &Device::Cpu)
-            ?.to_device(&weights.device)?;
+            ?.to_device(dev)?;
         let with_pe = projected.add(&pe_t)?;
 
         // Copy back to CPU staging buffer
@@ -421,69 +827,7 @@ fn encoder_forward_metal_inner(
         token_offset += w3;
     }
 
-    // -----------------------------------------------------------------------
-    // Upload full sequence to GPU for transformer layers
-    // -----------------------------------------------------------------------
-    let dev = &weights.device;
-    let mut x = Tensor::from_slice(&x_cpu, &[total_tokens, d_model], &Device::Cpu)
-        ?.to_device(dev)?;
-
-    // Build attention window boundaries
-    let window_token_size = tokens_per_chunk * (n_window_infer / chunk_size);
-    let n_windows = (total_tokens + window_token_size - 1) / window_token_size;
-    let mut window_starts_usize = vec![0usize; n_windows + 1];
-    for w in 0..n_windows {
-        window_starts_usize[w] = w * window_token_size;
-    }
-    window_starts_usize[n_windows] = total_tokens;
-
-    let scale = 1.0 / (head_dim as f32).sqrt();
-
-    // -----------------------------------------------------------------------
-    // Transformer layers
-    // -----------------------------------------------------------------------
-    for layer in &weights.layers {
-        // --- Self-attention ---
-
-        // LayerNorm on CPU (fast, avoids Metal broadcast compatibility issues)
-        let x_norm = layer_norm_gpu(&x, &layer.attn_norm_w, &layer.attn_norm_b, 1e-5)?;
-
-        // Q, K, V projections on GPU
-        let q_gpu = linear(&x_norm, &layer.wq, &layer.wq_bias)?;
-        let k_gpu = linear(&x_norm, &layer.wk, &layer.wk_bias)?;
-        let v_gpu = linear(&x_norm, &layer.wv, &layer.wv_bias)?;
-
-        // Windowed bidirectional attention entirely on GPU
-        let attn_out = windowed_attention_gpu(
-            &q_gpu, &k_gpu, &v_gpu,
-            n_heads, head_dim, scale,
-            &window_starts_usize, n_windows,
-        )?;
-
-        // Output projection on GPU + residual
-        let proj = linear(&attn_out, &layer.wo, &layer.wo_bias)?;
-        x = x.add(&proj)?;
-
-        // --- FFN ---
-        let x_norm2 = layer_norm_gpu(&x, &layer.ffn_norm_w, &layer.ffn_norm_b, 1e-5)?;
-        let ffn_up = linear(&x_norm2, &layer.fc1, &layer.fc1_bias)?;
-        let ffn_act = ffn_up.gelu_erf()?;
-        let ffn_down = linear(&ffn_act, &layer.fc2, &layer.fc2_bias)?;
-        x = x.add(&ffn_down)?;
-    }
-
-    // -----------------------------------------------------------------------
-    // Final post-processing
-    // -----------------------------------------------------------------------
-    let x_normed = layer_norm_gpu(&x, &weights.ln_post_w, &weights.ln_post_b, 1e-5)?;
-    let proj1 = linear(&x_normed, &weights.proj1_w, &weights.proj1_b)?;
-    let proj1_act = proj1.gelu_erf()?;
-    let enc_output = linear(&proj1_act, &weights.proj2_w, &weights.proj2_b)?;
-
-    // Copy final output back to CPU
-    let output_cpu = enc_output.to_device(&Device::Cpu)?
-        .to_dtype(DType::F32)?
-        .flatten_all()?.to_vec1::<f32>()?;
-
-    Ok((output_cpu, total_tokens))
+    // Upload full sequence to GPU
+    Tensor::from_slice(&x_cpu, &[total_tokens, d_model], &Device::Cpu)
+        ?.to_device(dev)
 }
