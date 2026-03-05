@@ -219,8 +219,7 @@ fn transcribe_segment(
             }
         }
 
-        ctx.tok_embed_to_f32(&mut input_embeds[..dim], token, dim);
-        token = ctx.decoder_forward(&input_embeds[..dim]);
+        token = ctx.decoder_forward_token(token);
     }
 
     let decode_ms = elapsed_ms(t0);
@@ -661,14 +660,12 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         let t0 = get_time_ms();
         let mut chunk_tokens: Vec<i32> = Vec::new();
         let mut n_generated = 0;
-        let mut tmp_embed = vec![0.0f32; dim];
 
         while n_generated < max_new_tokens {
             n_generated += 1;
             if token == TOKEN_ENDOFTEXT || token == TOKEN_IM_END { break; }
             chunk_tokens.push(token);
-            ctx.tok_embed_to_f32(&mut tmp_embed, token, dim);
-            token = ctx.decoder_forward(&tmp_embed);
+            token = ctx.decoder_forward_token(token);
         }
 
         let decode_ms = elapsed_ms(t0);
@@ -1197,14 +1194,12 @@ pub fn stream_push_audio(
     let t0 = get_time_ms();
     let mut chunk_tokens: Vec<i32> = Vec::new();
     let mut n_generated = 0;
-    let mut tmp_embed = vec![0.0f32; dim];
 
     while n_generated < max_new_tokens {
         n_generated += 1;
         if token == TOKEN_ENDOFTEXT || token == TOKEN_IM_END { break; }
         chunk_tokens.push(token);
-        ctx.tok_embed_to_f32(&mut tmp_embed, token, dim);
-        token = ctx.decoder_forward(&tmp_embed);
+        token = ctx.decoder_forward_token(token);
     }
 
     let decode_ms = elapsed_ms(t0);

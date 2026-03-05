@@ -12,6 +12,9 @@ use crate::decoder::{KvCache, RopeCache, DecoderBuffers};
 use crate::kernels;
 use crate::metal_ops::{RmsNormOp, RopeOp};
 
+use std::sync::Arc;
+use candle_metal_kernels::metal::Buffer;
+
 // ---------------------------------------------------------------------------
 // GPU weight structs
 // ---------------------------------------------------------------------------
@@ -702,6 +705,398 @@ pub fn decoder_forward_gpu(
         .flatten_all()?.to_vec1::<f32>()?;
 
     Ok(x_cpu)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: Raw Metal Buffer GPU Decode (bypass candle Tensor API)
+// ---------------------------------------------------------------------------
+
+/// Cached raw Buffer pointers for one transformer layer's weights.
+/// Safety: The source `DecoderGpuWeights` must outlive this struct.
+struct RawLayerPtrs {
+    wq: *const Buffer,
+    wk: *const Buffer,
+    wv: *const Buffer,
+    wo: *const Buffer,
+    gate_up: *const Buffer,
+    down: *const Buffer,
+    input_norm: *const Buffer,
+    post_attn_norm: *const Buffer,
+    q_norm: *const Buffer,
+    k_norm: *const Buffer,
+}
+
+unsafe impl Send for RawLayerPtrs {}
+unsafe impl Sync for RawLayerPtrs {}
+
+/// Pre-allocated raw Metal buffers and cached weight pointers for zero-alloc GPU decode.
+pub struct RawDecodeContext {
+    // 10 pre-allocated scratch buffers (~72 KB total)
+    h0: Arc<Buffer>,   // 1024 F32 — residual primary + input/output
+    h1: Arc<Buffer>,   // 1024 F32 — norm output, proj, ffn_out
+    h2: Arc<Buffer>,   // 1024 F32 — intermediate residual
+    q0: Arc<Buffer>,   // 2048 F32 — Q projection, Q after rope
+    q1: Arc<Buffer>,   // 2048 F32 — Q normed, SDPA output
+    kv0: Arc<Buffer>,  // 1024 F32 — K projection, K after rope
+    kv1: Arc<Buffer>,  // 1024 F32 — V projection
+    gu: Arc<Buffer>,   // 5632 F32 — gate_up matmul output
+    sw0: Arc<Buffer>,  // 2816 F32 — silu(gate)
+    sw1: Arc<Buffer>,  // 2816 F32 — SwiGLU output
+    // Cached raw weight buffer pointers per layer
+    layers: Vec<RawLayerPtrs>,
+}
+
+fn extract_buf_ptr(tensor: &Tensor) -> *const Buffer {
+    let (guard, _layout) = tensor.storage_and_layout();
+    let ms = match &*guard {
+        Storage::Metal(ms) => ms,
+        _ => panic!("extract_buf_ptr: expected Metal storage"),
+    };
+    ms.buffer() as *const Buffer
+}
+
+impl RawDecodeContext {
+    pub fn new(gpu_weights: &DecoderGpuWeights, cfg: &QwenConfig) -> Result<Self> {
+        let metal_dev = gpu_weights.device.as_metal_device()?;
+        let q_dim = cfg.dec_heads * cfg.dec_head_dim;
+        let kv_dim = cfg.dec_kv_heads * cfg.dec_head_dim;
+        let inter = cfg.dec_intermediate;
+
+        // Allocate scratch buffers via candle's allocator (goes through pool once)
+        let h0 = metal_dev.new_buffer(cfg.dec_hidden, DType::F32, "raw_h0")?;
+        let h1 = metal_dev.new_buffer(cfg.dec_hidden, DType::F32, "raw_h1")?;
+        let h2 = metal_dev.new_buffer(cfg.dec_hidden, DType::F32, "raw_h2")?;
+        let q0 = metal_dev.new_buffer(q_dim, DType::F32, "raw_q0")?;
+        let q1 = metal_dev.new_buffer(q_dim, DType::F32, "raw_q1")?;
+        let kv0 = metal_dev.new_buffer(kv_dim, DType::F32, "raw_kv0")?;
+        let kv1 = metal_dev.new_buffer(kv_dim, DType::F32, "raw_kv1")?;
+        let gu = metal_dev.new_buffer(2 * inter, DType::F32, "raw_gu")?;
+        let sw0 = metal_dev.new_buffer(inter, DType::F32, "raw_sw0")?;
+        let sw1 = metal_dev.new_buffer(inter, DType::F32, "raw_sw1")?;
+
+        // Cache weight buffer pointers (valid as long as gpu_weights is alive)
+        let mut layers = Vec::with_capacity(gpu_weights.layers.len());
+        for l in &gpu_weights.layers {
+            layers.push(RawLayerPtrs {
+                wq: extract_buf_ptr(&l.wq),
+                wk: extract_buf_ptr(&l.wk),
+                wv: extract_buf_ptr(&l.wv),
+                wo: extract_buf_ptr(&l.wo),
+                gate_up: extract_buf_ptr(&l.gate_up),
+                down: extract_buf_ptr(&l.down),
+                input_norm: extract_buf_ptr(&l.input_norm),
+                post_attn_norm: extract_buf_ptr(&l.post_attn_norm),
+                q_norm: extract_buf_ptr(&l.q_norm),
+                k_norm: extract_buf_ptr(&l.k_norm),
+            });
+        }
+
+        Ok(RawDecodeContext {
+            h0, h1, h2, q0, q1, kv0, kv1, gu, sw0, sw1, layers,
+        })
+    }
+}
+
+/// Raw Metal GPU single-token decode: zero Tensor allocations, single command encoder.
+///
+/// `input_embed`: [dim] f32 — the token embedding.
+/// Returns the final hidden state as [dim] f32 Vec (caller does final norm + LM head on CPU).
+pub fn decoder_forward_raw(
+    raw: &RawDecodeContext,
+    gpu_weights: &DecoderGpuWeights,
+    cfg: &QwenConfig,
+    gpu_kv: &mut GpuKvCache,
+    gpu_rope: &mut GpuRopeCache,
+    cpu_rope: &mut RopeCache,
+    input_embed: &[f32],
+) -> Result<Vec<f32>> {
+    use candle_metal_kernels::{
+        BufferOffset, GemmDType, SdpaDType,
+        call_rms_norm, call_rope_thd, call_mlx_gemm, call_sdpa_full,
+        call_binary_contiguous, call_binary_strided,
+        unary::{call_unary_strided, call_copy2d, strided, copy2d},
+    };
+
+    let dim = cfg.dec_hidden;
+    let n_heads = cfg.dec_heads;
+    let n_kv_heads = cfg.dec_kv_heads;
+    let head_dim = cfg.dec_head_dim;
+    let half_hd = head_dim / 2;
+    let intermediate = cfg.dec_intermediate;
+    let eps = cfg.dec_rms_norm_eps;
+    let theta = cfg.dec_rope_theta;
+    let q_dim = n_heads * head_dim;
+    let pos = gpu_kv.len;
+
+    // Ensure rope caches cover pos+1
+    cpu_rope.ensure(pos + 1, head_dim, theta);
+    gpu_rope.ensure(pos + 1, cpu_rope)?;
+
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let metal_dev = gpu_weights.device.as_metal_device()?;
+    let raw_device = metal_dev.device();
+    let kernels = metal_dev.kernels();
+
+    // Upload input embedding to h0 via memcpy (StorageModeShared)
+    unsafe {
+        let dst = raw.h0.contents() as *mut f32;
+        std::ptr::copy_nonoverlapping(input_embed.as_ptr(), dst, dim);
+    }
+
+    // Extract rope cos/sin buffers and compute byte offsets
+    let (rope_cos_guard, rope_cos_layout) = gpu_rope.cos.storage_and_layout();
+    let (rope_sin_guard, rope_sin_layout) = gpu_rope.sin.storage_and_layout();
+    let rope_cos_ms = match &*rope_cos_guard { Storage::Metal(ms) => ms, _ => candle_core::bail!("rope cos not Metal") };
+    let rope_sin_ms = match &*rope_sin_guard { Storage::Metal(ms) => ms, _ => candle_core::bail!("rope sin not Metal") };
+    let rope_cos_buf: &Buffer = rope_cos_ms.buffer();
+    let rope_sin_buf: &Buffer = rope_sin_ms.buffer();
+    let rope_cos_off = (rope_cos_layout.start_offset() + pos * half_hd) * 4;
+    let rope_sin_off = (rope_sin_layout.start_offset() + pos * half_hd) * 4;
+
+    // Extract KV cache buffers (hold guards for the entire decode step)
+    let n_layers = gpu_weights.layers.len();
+    let mut kv_k_guards = Vec::with_capacity(n_layers);
+    let mut kv_v_guards = Vec::with_capacity(n_layers);
+    let mut kv_k_bufs: Vec<&Buffer> = Vec::with_capacity(n_layers);
+    let mut kv_v_bufs: Vec<&Buffer> = Vec::with_capacity(n_layers);
+    for layer in 0..n_layers {
+        let (kg, _) = gpu_kv.k[layer].storage_and_layout();
+        let (vg, _) = gpu_kv.v[layer].storage_and_layout();
+        kv_k_guards.push(kg);
+        kv_v_guards.push(vg);
+    }
+    for layer in 0..n_layers {
+        let kb = match &*kv_k_guards[layer] { Storage::Metal(ms) => ms.buffer(), _ => candle_core::bail!("kv not Metal") };
+        let vb = match &*kv_v_guards[layer] { Storage::Metal(ms) => ms.buffer(), _ => candle_core::bail!("kv not Metal") };
+        // Safety: guards are held in kv_k_guards/kv_v_guards for the duration
+        kv_k_bufs.push(unsafe { &*(kb as *const Buffer) });
+        kv_v_bufs.push(unsafe { &*(vb as *const Buffer) });
+    }
+
+    let max_seq = gpu_kv.max_seq;
+    let total_seq = pos + 1;
+
+    // Get a single command encoder for ALL layers
+    let encoder = metal_dev.command_encoder()?;
+
+    // SDPA shapes/strides (constant across layers)
+    let q_shape = [1, n_heads, 1, head_dim];
+    let q_strides = [q_dim, head_dim, head_dim, 1];
+    let k_shape = [1, n_kv_heads, total_seq, head_dim];
+    let k_strides = [n_kv_heads * max_seq * head_dim, max_seq * head_dim, head_dim, 1];
+    let v_strides = k_strides;
+    let o_strides = [q_dim, head_dim, head_dim, 1];
+
+    for layer_idx in 0..n_layers {
+        let w = &raw.layers[layer_idx];
+
+        // Safety: all these pointers are valid because gpu_weights is alive
+        let w_input_norm: &Buffer = unsafe { &*w.input_norm };
+        let w_post_attn_norm: &Buffer = unsafe { &*w.post_attn_norm };
+        let w_q_norm: &Buffer = unsafe { &*w.q_norm };
+        let w_k_norm: &Buffer = unsafe { &*w.k_norm };
+        let w_wq: &Buffer = unsafe { &*w.wq };
+        let w_wk: &Buffer = unsafe { &*w.wk };
+        let w_wv: &Buffer = unsafe { &*w.wv };
+        let w_wo: &Buffer = unsafe { &*w.wo };
+        let w_gate_up: &Buffer = unsafe { &*w.gate_up };
+        let w_down: &Buffer = unsafe { &*w.down };
+
+        // K1: RMSNorm(h0, input_norm → h1)
+        call_rms_norm(
+            raw_device, &encoder, kernels, "rmsnorm_f32",
+            dim, dim, eps,
+            &raw.h0, 0, w_input_norm, 0, &raw.h1,
+        ).map_err(candle_core::Error::wrap)?;
+
+        // K2: GEMM h1 @ wq^T → q0 [2048]
+        // W stored [n=q_dim, k=dim] row-major. rhs viewed as [k, n] needs stride [1, k=dim].
+        call_mlx_gemm(
+            raw_device, &encoder, kernels, GemmDType::F32,
+            (1, 1, q_dim, dim),
+            &[dim, 1], 0, &raw.h1,
+            &[1, dim], 0, w_wq,
+            &raw.q0,
+        ).map_err(candle_core::Error::wrap)?;
+
+        // K3: GEMM h1 @ wk^T → kv0 [1024]
+        call_mlx_gemm(
+            raw_device, &encoder, kernels, GemmDType::F32,
+            (1, 1, n_kv_heads * head_dim, dim),
+            &[dim, 1], 0, &raw.h1,
+            &[1, dim], 0, w_wk,
+            &raw.kv0,
+        ).map_err(candle_core::Error::wrap)?;
+
+        // K4: GEMM h1 @ wv^T → kv1 [1024]
+        call_mlx_gemm(
+            raw_device, &encoder, kernels, GemmDType::F32,
+            (1, 1, n_kv_heads * head_dim, dim),
+            &[dim, 1], 0, &raw.h1,
+            &[1, dim], 0, w_wv,
+            &raw.kv1,
+        ).map_err(candle_core::Error::wrap)?;
+
+        // K5: per-head RMSNorm(q0, q_norm → q1)  [16 rows × 128]
+        call_rms_norm(
+            raw_device, &encoder, kernels, "rmsnorm_f32",
+            q_dim, head_dim, eps,
+            &raw.q0, 0, w_q_norm, 0, &raw.q1,
+        ).map_err(candle_core::Error::wrap)?;
+
+        // K6: per-head RMSNorm(kv0, k_norm → h1)  [8 rows × 128]
+        call_rms_norm(
+            raw_device, &encoder, kernels, "rmsnorm_f32",
+            n_kv_heads * head_dim, head_dim, eps,
+            &raw.kv0, 0, w_k_norm, 0, &raw.h1,
+        ).map_err(candle_core::Error::wrap)?;
+
+        // K7: RoPE on Q (q1 → q0)
+        call_rope_thd(
+            raw_device, &encoder, kernels, "rope_thd_f32",
+            1, 1, n_heads, head_dim, 0,
+            &raw.q1, 0,
+            rope_cos_buf, rope_cos_off,
+            rope_sin_buf, rope_sin_off,
+            &raw.q0,
+        ).map_err(candle_core::Error::wrap)?;
+
+        // K8: RoPE on K (h1 → kv0)
+        call_rope_thd(
+            raw_device, &encoder, kernels, "rope_thd_f32",
+            1, 1, n_kv_heads, head_dim, 0,
+            &raw.h1, 0,
+            rope_cos_buf, rope_cos_off,
+            rope_sin_buf, rope_sin_off,
+            &raw.kv0,
+        ).map_err(candle_core::Error::wrap)?;
+
+        // K9a: Write K into KV cache via copy2d
+        call_copy2d(
+            raw_device, &encoder, kernels, copy2d::FLOAT,
+            &raw.kv0, kv_k_bufs[layer_idx],
+            n_kv_heads, head_dim,
+            head_dim, max_seq * head_dim,
+            0, pos * head_dim * 4,
+        ).map_err(candle_core::Error::wrap)?;
+
+        // K9b: Write V into KV cache via copy2d
+        call_copy2d(
+            raw_device, &encoder, kernels, copy2d::FLOAT,
+            &raw.kv1, kv_v_bufs[layer_idx],
+            n_kv_heads, head_dim,
+            head_dim, max_seq * head_dim,
+            0, pos * head_dim * 4,
+        ).map_err(candle_core::Error::wrap)?;
+
+        // K10: SDPA(q0, cache_k, cache_v → q1) [2048]
+        call_sdpa_full(
+            raw_device, &encoder, kernels,
+            0, &q_shape, &q_strides, &raw.q0,
+            0, &k_shape, &k_strides, kv_k_bufs[layer_idx],
+            0, kv_v_bufs[layer_idx], &v_strides,
+            None, None, None,
+            &raw.q1, &o_strides,
+            scale, true, SdpaDType::F32,
+        ).map_err(candle_core::Error::wrap)?;
+
+        // K11: GEMM q1 @ wo^T → h1 [1024]
+        // wo stored [n=dim, k=q_dim] row-major. rhs stride = [1, k=q_dim].
+        call_mlx_gemm(
+            raw_device, &encoder, kernels, GemmDType::F32,
+            (1, 1, dim, q_dim),
+            &[q_dim, 1], 0, &raw.q1,
+            &[1, q_dim], 0, w_wo,
+            &raw.h1,
+        ).map_err(candle_core::Error::wrap)?;
+
+        // K12: residual h0 + h1 → h2
+        call_binary_contiguous(
+            raw_device, &encoder, kernels, "badd_f32", 4, dim,
+            BufferOffset::zero_offset(&raw.h0),
+            BufferOffset::zero_offset(&raw.h1),
+            &raw.h2,
+        ).map_err(candle_core::Error::wrap)?;
+
+        // K13: RMSNorm(h2, post_attn_norm → h1)
+        call_rms_norm(
+            raw_device, &encoder, kernels, "rmsnorm_f32",
+            dim, dim, eps,
+            &raw.h2, 0, w_post_attn_norm, 0, &raw.h1,
+        ).map_err(candle_core::Error::wrap)?;
+
+        // K14: GEMM h1 @ gate_up^T → gu [5632]
+        // gate_up stored [n=2*inter, k=dim] row-major. rhs stride = [1, k=dim].
+        call_mlx_gemm(
+            raw_device, &encoder, kernels, GemmDType::F32,
+            (1, 1, 2 * intermediate, dim),
+            &[dim, 1], 0, &raw.h1,
+            &[1, dim], 0, w_gate_up,
+            &raw.gu,
+        ).map_err(candle_core::Error::wrap)?;
+
+        // K15: silu(gate) — read gate at stride 2 from gu → sw0
+        call_unary_strided(
+            raw_device, &encoder, kernels,
+            strided::silu::FLOAT,
+            &[intermediate],
+            BufferOffset::zero_offset(&raw.gu),
+            &[2],
+            BufferOffset::zero_offset(&raw.sw0),
+        ).map_err(candle_core::Error::wrap)?;
+
+        // K16: silu(gate) * up → sw1
+        call_binary_strided(
+            raw_device, &encoder, kernels, "bmul_f32_strided", 4,
+            &[intermediate],
+            BufferOffset::zero_offset(&raw.sw0), &[1],
+            BufferOffset { buffer: &raw.gu, offset_in_bytes: 4 }, &[2],
+            &raw.sw1,
+        ).map_err(candle_core::Error::wrap)?;
+
+        // K17: GEMM sw1 @ down^T → h1 [1024]
+        // down stored [n=dim, k=inter] row-major. rhs stride = [1, k=inter].
+        call_mlx_gemm(
+            raw_device, &encoder, kernels, GemmDType::F32,
+            (1, 1, dim, intermediate),
+            &[intermediate, 1], 0, &raw.sw1,
+            &[1, intermediate], 0, w_down,
+            &raw.h1,
+        ).map_err(candle_core::Error::wrap)?;
+
+        // K18: residual h2 + h1 → h0
+        call_binary_contiguous(
+            raw_device, &encoder, kernels, "badd_f32", 4, dim,
+            BufferOffset::zero_offset(&raw.h2),
+            BufferOffset::zero_offset(&raw.h1),
+            &raw.h0,
+        ).map_err(candle_core::Error::wrap)?;
+    }
+
+    // Drop encoder → end_encoding
+    drop(encoder);
+
+    // Drop KV cache guards
+    drop(kv_k_guards);
+    drop(kv_v_guards);
+    // Drop rope guards
+    drop(rope_cos_guard);
+    drop(rope_sin_guard);
+
+    // Wait for GPU to finish
+    metal_dev.wait_until_completed()?;
+
+    gpu_kv.len = total_seq;
+
+    // Read output from h0 via memcpy
+    let mut out = vec![0.0f32; dim];
+    unsafe {
+        let src = raw.h0.contents() as *const f32;
+        std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), dim);
+    }
+
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
