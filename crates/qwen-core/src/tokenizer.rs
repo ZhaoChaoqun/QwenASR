@@ -120,6 +120,132 @@ fn fnv1a_hash(s: &str) -> u64 {
     h
 }
 
+/// Check if a character is a Unicode letter (\p{L}).
+/// Includes CJK ideographs, Latin, Cyrillic, etc.
+fn is_unicode_letter(c: char) -> bool {
+    c.is_alphabetic()
+}
+
+/// Check if a character is a Unicode number (\p{N}).
+fn is_unicode_number(c: char) -> bool {
+    c.is_ascii_digit() || c.is_numeric()
+}
+
+/// Pre-tokenize text following the Qwen3/GPT-2 regex pattern:
+///   `[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
+///
+/// Key behavior:
+///   - Consecutive Unicode letters (including CJK) form ONE word
+///   - An optional non-letter-non-number prefix char is attached to letter runs
+///   - Each digit is its own word
+///   - Spaces/punctuation handled per the pattern
+fn pre_tokenize(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+
+    let mut words = Vec::new();
+    let mut i = 0;
+    let n = chars.len();
+
+    while i < n {
+        let c = chars[i];
+
+        // Pattern 1: [^\r\n\p{L}\p{N}]?\p{L}+
+        // Optional non-letter-non-number-non-newline char, then one or more letters.
+        if is_unicode_letter(c) {
+            let mut word = String::new();
+            while i < n && is_unicode_letter(chars[i]) {
+                word.push(chars[i]);
+                i += 1;
+            }
+            words.push(word);
+        } else if !is_unicode_number(c) && c != '\r' && c != '\n'
+            && i + 1 < n && is_unicode_letter(chars[i + 1])
+        {
+            // Non-letter-non-number-non-newline char followed by letters
+            let mut word = String::new();
+            word.push(c);
+            i += 1;
+            while i < n && is_unicode_letter(chars[i]) {
+                word.push(chars[i]);
+                i += 1;
+            }
+            words.push(word);
+        }
+        // Pattern 2: \p{N}
+        else if is_unicode_number(c) {
+            words.push(c.to_string());
+            i += 1;
+        }
+        // Pattern 3: ` ?[^\s\p{L}\p{N}]+[\r\n]*`
+        // Optional space, then non-whitespace-non-letter-non-number chars, then optional newlines
+        else if c == ' ' && i + 1 < n
+            && !chars[i + 1].is_whitespace()
+            && !is_unicode_letter(chars[i + 1])
+            && !is_unicode_number(chars[i + 1])
+        {
+            let mut word = String::new();
+            word.push(c);
+            i += 1;
+            while i < n
+                && !chars[i].is_whitespace()
+                && !is_unicode_letter(chars[i])
+                && !is_unicode_number(chars[i])
+            {
+                word.push(chars[i]);
+                i += 1;
+            }
+            while i < n && (chars[i] == '\r' || chars[i] == '\n') {
+                word.push(chars[i]);
+                i += 1;
+            }
+            words.push(word);
+        } else if !c.is_whitespace() && !is_unicode_letter(c) && !is_unicode_number(c) {
+            // Non-space punctuation/symbol without preceding space
+            let mut word = String::new();
+            while i < n
+                && !chars[i].is_whitespace()
+                && !is_unicode_letter(chars[i])
+                && !is_unicode_number(chars[i])
+            {
+                word.push(chars[i]);
+                i += 1;
+            }
+            while i < n && (chars[i] == '\r' || chars[i] == '\n') {
+                word.push(chars[i]);
+                i += 1;
+            }
+            words.push(word);
+        }
+        // Pattern 4: \s*[\r\n]+
+        else if c == '\r' || c == '\n' {
+            let mut word = String::new();
+            while i < n && (chars[i] == '\r' || chars[i] == '\n' || chars[i] == ' ' || chars[i] == '\t') {
+                word.push(chars[i]);
+                i += 1;
+            }
+            words.push(word);
+        }
+        // Pattern 5: \s+
+        else if c.is_whitespace() {
+            let mut word = String::new();
+            while i < n && chars[i].is_whitespace() {
+                word.push(chars[i]);
+                i += 1;
+            }
+            words.push(word);
+        } else {
+            // Fallback: single char
+            words.push(c.to_string());
+            i += 1;
+        }
+    }
+
+    words
+}
+
 pub struct QwenTokenizer {
     pub vocab_size: usize,
     id_to_text: Vec<Option<String>>,
@@ -208,6 +334,131 @@ impl QwenTokenizer {
         })
     }
 
+    /// Load tokenizer from a model directory.
+    /// Tries `vocab.json` first, then falls back to HuggingFace `tokenizer.json`.
+    pub fn load_from_dir(model_dir: &str) -> Option<Self> {
+        let vocab_path = format!("{}/vocab.json", model_dir);
+        if std::path::Path::new(&vocab_path).exists() {
+            return Self::load(&vocab_path);
+        }
+        let hf_path = format!("{}/tokenizer.json", model_dir);
+        Self::load_hf_tokenizer_json(&hf_path)
+    }
+
+    /// Load from HuggingFace tokenizer.json format.
+    /// Extracts `model.vocab`, `added_tokens`, and `model.merges`.
+    fn load_hf_tokenizer_json(path: &str) -> Option<Self> {
+        let (byte_to_unicode, unicode_to_byte) = init_gpt2_mapping();
+
+        let json = std::fs::read_to_string(path).ok()?;
+        let bytes = json.as_bytes();
+
+        // Extract model.vocab object: find "vocab": { ... }
+        let vocab_str = find_json_object(bytes, "vocab")?;
+        let mut max_id = 0i32;
+        let mut entries: Vec<(String, i32)> = Vec::new();
+        parse_vocab_object(vocab_str.as_bytes(), &mut entries, &mut max_id);
+
+        // Extract added_tokens array: find "added_tokens": [ ... ]
+        if let Some(added_arr) = find_json_array(bytes, "added_tokens") {
+            parse_added_tokens(added_arr.as_bytes(), &mut entries, &mut max_id);
+        }
+
+        let vocab_size = (max_id + 1) as usize;
+        let mut id_to_text = vec![None; vocab_size];
+        let mut id_to_bytes: Vec<Option<Vec<u8>>> = vec![None; vocab_size];
+        let mut id_to_bpe = vec![None; vocab_size];
+        let mut vocab_map = HashMap::new();
+
+        for (key, id) in &entries {
+            let idx = *id as usize;
+            if idx < vocab_size {
+                let raw_bytes = decode_gpt2_token_bytes(key, &unicode_to_byte);
+                let text = String::from_utf8_lossy(&raw_bytes).into_owned();
+                id_to_text[idx] = Some(text);
+                id_to_bytes[idx] = Some(raw_bytes);
+                vocab_map.insert(key.clone(), *id);
+                id_to_bpe[idx] = Some(key.clone());
+            }
+        }
+
+        // For added tokens (special tokens like <|im_start|>), store them
+        // with their raw content as both text and bytes.
+        // Re-parse added_tokens to get "content" field for special tokens.
+        if let Some(added_arr) = find_json_array(bytes, "added_tokens") {
+            parse_added_tokens_content(added_arr.as_bytes(), &mut id_to_text, &mut id_to_bytes, vocab_size);
+        }
+
+        // Extract merges from model.merges array.
+        // Format can be either:
+        //   (a) Array of strings: ["a b", "c d", ...]   (merges.txt style)
+        //   (b) Array of arrays:  [["a","b"], ["c","d"], ...]  (HuggingFace tokenizer.json)
+        let mut merge_map = HashMap::new();
+        if let Some(merges_arr) = find_json_nested_array(bytes, "model", "merges") {
+            let mut rank = 0i32;
+            let arr_bytes = merges_arr.as_bytes();
+            let mut pos = 0usize;
+            skip_ws(arr_bytes, &mut pos);
+            if pos < arr_bytes.len() && arr_bytes[pos] == b'[' {
+                pos += 1;
+            }
+            loop {
+                skip_ws(arr_bytes, &mut pos);
+                if pos >= arr_bytes.len() || arr_bytes[pos] == b']' {
+                    break;
+                }
+                if arr_bytes[pos] == b',' {
+                    pos += 1;
+                    continue;
+                }
+                if arr_bytes[pos] == b'[' {
+                    // Format (b): inner array ["a", "b"]
+                    pos += 1; // skip '['
+                    let a = match parse_json_string_tok(arr_bytes, &mut pos) {
+                        Some(s) => s,
+                        None => break,
+                    };
+                    skip_ws(arr_bytes, &mut pos);
+                    if pos < arr_bytes.len() && arr_bytes[pos] == b',' {
+                        pos += 1;
+                    }
+                    let b = match parse_json_string_tok(arr_bytes, &mut pos) {
+                        Some(s) => s,
+                        None => break,
+                    };
+                    skip_ws(arr_bytes, &mut pos);
+                    if pos < arr_bytes.len() && arr_bytes[pos] == b']' {
+                        pos += 1; // skip ']'
+                    }
+                    let key = format!("{} {}", a, b);
+                    merge_map.insert(key, rank);
+                    rank += 1;
+                } else if arr_bytes[pos] == b'"' {
+                    // Format (a): string "a b"
+                    if let Some(merge_str) = parse_json_string_tok(arr_bytes, &mut pos) {
+                        merge_map.insert(merge_str, rank);
+                        rank += 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Some(QwenTokenizer {
+            vocab_size,
+            id_to_text,
+            id_to_bytes,
+            id_to_bpe,
+            vocab_map,
+            merge_map,
+            byte_to_unicode,
+            unicode_to_byte,
+        })
+    }
+
     pub fn decode(&self, token_id: i32) -> &str {
         if token_id < 0 || token_id as usize >= self.vocab_size {
             return "";
@@ -236,9 +487,20 @@ impl QwenTokenizer {
             return None;
         }
 
-        let mapped = text_to_bpe_unicode(text, &self.byte_to_unicode);
-        let ids = self.encode_bpe_word(&mapped)?;
-        Some(ids)
+        // Pre-tokenize into words using GPT-2/Qwen3 splitting rules:
+        // Split on boundaries between character classes (letter/number/space/other).
+        // Each Chinese character becomes its own word.
+        let words = pre_tokenize(text);
+        let mut all_ids = Vec::new();
+        for word in &words {
+            let mapped = text_to_bpe_unicode(word, &self.byte_to_unicode);
+            if let Some(ids) = self.encode_bpe_word(&mapped) {
+                all_ids.extend(ids);
+            } else {
+                return None;
+            }
+        }
+        Some(all_ids)
     }
 
     fn encode_bpe_word(&self, mapped: &str) -> Option<Vec<i32>> {
@@ -408,6 +670,292 @@ fn parse_json_int_tok(bytes: &[u8], pos: &mut usize) -> Option<i64> {
         return None;
     }
     Some(if neg { -val } else { val })
+}
+
+// ========================================================================
+// HuggingFace tokenizer.json parsing helpers
+// ========================================================================
+
+/// Find a JSON object value for a given top-level or nested key.
+/// Returns the substring from `{` to matching `}` (inclusive).
+fn find_json_object(bytes: &[u8], key: &str) -> Option<String> {
+    let needle = format!("\"{}\"", key);
+    let needle_bytes = needle.as_bytes();
+    let mut i = 0;
+    while i + needle_bytes.len() <= bytes.len() {
+        if &bytes[i..i + needle_bytes.len()] == needle_bytes {
+            let mut j = i + needle_bytes.len();
+            skip_ws(bytes, &mut j);
+            if j < bytes.len() && bytes[j] == b':' {
+                j += 1;
+                skip_ws(bytes, &mut j);
+                if j < bytes.len() && bytes[j] == b'{' {
+                    let start = j;
+                    let end = find_matching_brace(bytes, j)?;
+                    return Some(String::from_utf8_lossy(&bytes[start..=end]).into_owned());
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find a JSON array value for a given key.
+/// Returns the substring from `[` to matching `]` (inclusive).
+fn find_json_array(bytes: &[u8], key: &str) -> Option<String> {
+    let needle = format!("\"{}\"", key);
+    let needle_bytes = needle.as_bytes();
+    let mut i = 0;
+    while i + needle_bytes.len() <= bytes.len() {
+        if &bytes[i..i + needle_bytes.len()] == needle_bytes {
+            let mut j = i + needle_bytes.len();
+            skip_ws(bytes, &mut j);
+            if j < bytes.len() && bytes[j] == b':' {
+                j += 1;
+                skip_ws(bytes, &mut j);
+                if j < bytes.len() && bytes[j] == b'[' {
+                    let start = j;
+                    let end = find_matching_bracket(bytes, j)?;
+                    return Some(String::from_utf8_lossy(&bytes[start..=end]).into_owned());
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find a nested array: first find "outer" object, then "inner" array inside it.
+fn find_json_nested_array(bytes: &[u8], outer_key: &str, inner_key: &str) -> Option<String> {
+    let outer = find_json_object(bytes, outer_key)?;
+    find_json_array(outer.as_bytes(), inner_key)
+}
+
+fn find_matching_brace(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = start;
+    let mut in_string = false;
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == b'"' {
+                in_string = false;
+            }
+        } else {
+            match bytes[i] {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_matching_bracket(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = start;
+    let mut in_string = false;
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == b'"' {
+                in_string = false;
+            }
+        } else {
+            match bytes[i] {
+                b'"' => in_string = true,
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse a vocab object: { "token": id, ... }
+fn parse_vocab_object(bytes: &[u8], entries: &mut Vec<(String, i32)>, max_id: &mut i32) {
+    let mut pos = 0;
+    skip_ws(bytes, &mut pos);
+    if pos >= bytes.len() || bytes[pos] != b'{' {
+        return;
+    }
+    pos += 1;
+
+    loop {
+        skip_ws(bytes, &mut pos);
+        if pos >= bytes.len() || bytes[pos] == b'}' {
+            break;
+        }
+        if bytes[pos] == b',' {
+            pos += 1;
+            continue;
+        }
+        let key = match parse_json_string_tok(bytes, &mut pos) {
+            Some(k) => k,
+            None => break,
+        };
+        skip_ws(bytes, &mut pos);
+        if pos >= bytes.len() || bytes[pos] != b':' {
+            break;
+        }
+        pos += 1;
+        let id = match parse_json_int_tok(bytes, &mut pos) {
+            Some(v) => v as i32,
+            None => break,
+        };
+        if id > *max_id {
+            *max_id = id;
+        }
+        entries.push((key, id));
+    }
+}
+
+/// Parse added_tokens array: [ { "id": N, "content": "...", ... }, ... ]
+/// Extracts id and content, stores content as the vocab key.
+fn parse_added_tokens(bytes: &[u8], entries: &mut Vec<(String, i32)>, max_id: &mut i32) {
+    let mut pos = 0;
+    skip_ws(bytes, &mut pos);
+    if pos >= bytes.len() || bytes[pos] != b'[' {
+        return;
+    }
+    pos += 1;
+
+    loop {
+        skip_ws(bytes, &mut pos);
+        if pos >= bytes.len() || bytes[pos] == b']' {
+            break;
+        }
+        if bytes[pos] == b',' {
+            pos += 1;
+            continue;
+        }
+        if bytes[pos] == b'{' {
+            let obj_start = pos;
+            let obj_end = match find_matching_brace(bytes, pos) {
+                Some(e) => e,
+                None => break,
+            };
+            let obj_bytes = &bytes[obj_start..=obj_end];
+            let id = extract_json_int_field(obj_bytes, "id");
+            let content = extract_json_string_field(obj_bytes, "content");
+            if let (Some(id), Some(content)) = (id, content) {
+                let id = id as i32;
+                if id > *max_id {
+                    *max_id = id;
+                }
+                entries.push((content, id));
+            }
+            pos = obj_end + 1;
+        } else {
+            break;
+        }
+    }
+}
+
+/// Re-parse added_tokens to store special token content as direct text/bytes.
+fn parse_added_tokens_content(
+    bytes: &[u8],
+    id_to_text: &mut Vec<Option<String>>,
+    id_to_bytes: &mut Vec<Option<Vec<u8>>>,
+    vocab_size: usize,
+) {
+    let mut pos = 0;
+    skip_ws(bytes, &mut pos);
+    if pos >= bytes.len() || bytes[pos] != b'[' {
+        return;
+    }
+    pos += 1;
+
+    loop {
+        skip_ws(bytes, &mut pos);
+        if pos >= bytes.len() || bytes[pos] == b']' {
+            break;
+        }
+        if bytes[pos] == b',' {
+            pos += 1;
+            continue;
+        }
+        if bytes[pos] == b'{' {
+            let obj_start = pos;
+            let obj_end = match find_matching_brace(bytes, pos) {
+                Some(e) => e,
+                None => break,
+            };
+            let obj_bytes = &bytes[obj_start..=obj_end];
+            let id = extract_json_int_field(obj_bytes, "id");
+            let content = extract_json_string_field(obj_bytes, "content");
+            if let (Some(id), Some(content)) = (id, content) {
+                let idx = id as usize;
+                if idx < vocab_size {
+                    id_to_bytes[idx] = Some(content.as_bytes().to_vec());
+                    id_to_text[idx] = Some(content);
+                }
+            }
+            pos = obj_end + 1;
+        } else {
+            break;
+        }
+    }
+}
+
+/// Extract an integer field from a JSON object.
+fn extract_json_int_field(bytes: &[u8], field: &str) -> Option<i64> {
+    let needle = format!("\"{}\"", field);
+    let needle_bytes = needle.as_bytes();
+    let mut i = 0;
+    while i + needle_bytes.len() <= bytes.len() {
+        if &bytes[i..i + needle_bytes.len()] == needle_bytes {
+            let mut j = i + needle_bytes.len();
+            skip_ws(bytes, &mut j);
+            if j < bytes.len() && bytes[j] == b':' {
+                j += 1;
+                return parse_json_int_tok(bytes, &mut j);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Extract a string field from a JSON object.
+fn extract_json_string_field(bytes: &[u8], field: &str) -> Option<String> {
+    let needle = format!("\"{}\"", field);
+    let needle_bytes = needle.as_bytes();
+    let mut i = 0;
+    while i + needle_bytes.len() <= bytes.len() {
+        if &bytes[i..i + needle_bytes.len()] == needle_bytes {
+            let mut j = i + needle_bytes.len();
+            skip_ws(bytes, &mut j);
+            if j < bytes.len() && bytes[j] == b':' {
+                j += 1;
+                return parse_json_string_tok(bytes, &mut j);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 // ========================================================================

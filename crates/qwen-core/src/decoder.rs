@@ -52,11 +52,17 @@ fn load_bf16_direct(ms: &MultiSafetensors, name: &str) -> Option<*const u16> {
 
 impl Decoder {
     pub fn load(ms: &MultiSafetensors, cfg: &QwenConfig) -> Option<Self> {
-        let tok_embeddings_bf16 = load_bf16_direct(ms, "thinker.model.embed_tokens.weight")?;
+        Self::load_with_prefix(ms, cfg, "thinker.")
+    }
+
+    /// Load decoder weights with a custom prefix.
+    /// ASR models use "thinker.", standalone LLMs use "".
+    pub fn load_with_prefix(ms: &MultiSafetensors, cfg: &QwenConfig, prefix: &str) -> Option<Self> {
+        let tok_embeddings_bf16 = load_bf16_direct(ms, &format!("{}model.embed_tokens.weight", prefix))?;
 
         let mut layers = Vec::new();
         for i in 0..cfg.dec_layers {
-            let lp = format!("thinker.model.layers.{}", i);
+            let lp = format!("{}model.layers.{}", prefix, i);
 
             let wq = load_bf16_direct(ms, &format!("{}.self_attn.q_proj.weight", lp))?;
             let wk = load_bf16_direct(ms, &format!("{}.self_attn.k_proj.weight", lp))?;
@@ -103,15 +109,15 @@ impl Decoder {
             });
         }
 
-        let norm = load_f32(ms, "thinker.model.norm.weight")?;
+        let norm = load_f32(ms, &format!("{}model.norm.weight", prefix))?;
 
         // Load separate lm_head if present (forced aligner has untied lm_head)
         let lm_head_bf16 = if cfg.classify_num > 0 {
-            let ptr = load_bf16_direct(ms, "thinker.lm_head.weight")?;
+            let ptr = load_bf16_direct(ms, &format!("{}lm_head.weight", prefix))?;
             Some(ptr)
         } else {
-            // For normal ASR, lm_head is tied with tok_embeddings (no separate weight)
-            ms.get_bf16_direct("thinker.lm_head.weight")
+            // For normal ASR/LLM, lm_head is tied with tok_embeddings (no separate weight)
+            ms.get_bf16_direct(&format!("{}lm_head.weight", prefix))
         };
 
         Some(Decoder {

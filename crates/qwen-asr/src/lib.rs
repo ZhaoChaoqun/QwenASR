@@ -55,14 +55,24 @@
 
 #![allow(dead_code)]
 
-pub mod config;
-pub mod safetensors;
+// Re-export core modules for backwards compatibility
+pub use qwen_core::config;
+pub use qwen_core::tokenizer;
+pub use qwen_core::safetensors;
+pub use qwen_core::quantize;
+pub use qwen_core::decoder;
+pub use qwen_core::kernels;
+#[cfg(feature = "metal")]
+pub use qwen_core::device;
+#[cfg(feature = "metal")]
+pub use qwen_core::gpu_tensors;
+#[cfg(feature = "metal")]
+pub use qwen_core::metal_ops;
+#[cfg(feature = "metal")]
+pub use qwen_core::decoder_gpu;
+
 pub mod audio;
-pub mod tokenizer;
-pub mod kernels;
-pub mod quantize;
 pub mod encoder;
-pub mod decoder;
 pub mod context;
 pub mod transcribe;
 pub mod align;
@@ -71,15 +81,7 @@ pub mod c_api;
 #[cfg(feature = "android")]
 pub mod jni_api;
 #[cfg(feature = "metal")]
-pub mod device;
-#[cfg(feature = "metal")]
-pub mod gpu_tensors;
-#[cfg(feature = "metal")]
-pub mod metal_ops;
-#[cfg(feature = "metal")]
 pub mod encoder_gpu;
-#[cfg(feature = "metal")]
-pub mod decoder_gpu;
 
 /// Returns a list of compile-time optimization flags enabled for this build.
 pub fn optimization_flags() -> Vec<&'static str> {

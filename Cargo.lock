@@ -1217,6 +1217,7 @@ dependencies = [
  "candle-core",
  "candle-metal-kernels",
  "libc",
+ "qwen-core",
 ]
 
 [[package]]
@@ -1234,6 +1235,15 @@ name = "qwen-asr-quantize"
 version = "0.1.0"
 dependencies = [
  "qwen-asr",
+]
+
+[[package]]
+name = "qwen-core"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "candle-metal-kernels",
+ "libc",
 ]
 
 [[package]]
