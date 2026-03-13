@@ -158,6 +158,27 @@ pub unsafe extern "C" fn qwen_asr_set_language(
     }
 }
 
+/// Set an optional system prompt to guide transcription behavior.
+/// The prompt is placed after the system role token in the decoder input.
+/// Pass an empty string to clear the prompt.
+#[no_mangle]
+pub unsafe extern "C" fn qwen_asr_set_prompt(
+    engine: *mut QwenAsrEngine,
+    prompt: *const c_char,
+) -> i32 {
+    if engine.is_null() || prompt.is_null() {
+        return -1;
+    }
+    let prompt_str = match CStr::from_ptr(prompt).to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    match (*engine).ctx.set_prompt(prompt_str) {
+        Ok(()) => 0,
+        Err(()) => -1,
+    }
+}
+
 /// Free a string returned by qwen_asr_transcribe_*.
 #[no_mangle]
 pub unsafe extern "C" fn qwen_asr_free_string(s: *mut c_char) {
